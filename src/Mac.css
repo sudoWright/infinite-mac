@@ -1,11 +1,17 @@
 .Mac {
     user-select: none;
+    -webkit-user-select: none;
 }
 
 /* `@media (display-mode: fullscreen)` does not appear to work in iOS Safari,
 we need to use a manual class name. */
 body.fullscreen {
     background: black;
+}
+
+body.embed {
+    background: black;
+    overflow: hidden;
 }
 
 .Mac-Loading {
@@ -20,6 +26,31 @@ body.fullscreen {
     color: white;
 }
 
+.Mac-Loading-Non-Modal {
+    height: auto;
+    left: 50%;
+    width: auto;
+    transform: translate(-50%, 0);
+    top: auto;
+    bottom: calc(var(--screen-underscan) + 10px);
+    background: #282c3422;
+    padding: 10px;
+    border-radius: 10px;
+}
+
+.Mac-Loading-Non-Modal a {
+    color: inherit;
+}
+
+.Mac-Loading-OneLine {
+    white-space: nowrap;
+    display: block;
+}
+
+.Mac-Loading-Dismiss {
+    margin-right: 8px;
+}
+
 .Mac-Loading-Fraction {
     opacity: 0.5;
     padding-left: 0.5em;
@@ -28,9 +59,9 @@ body.fullscreen {
 .Mac-Screen {
     /* The emulator draws the cursor */
     cursor: none;
-    /* Avoid bluriness on retina screens */
+    /* Avoid blurriness on retina screens */
     image-rendering: pixelated;
-    /* Disable touble-tap to zoom, we want double-clicking in the Mac to
+    /* Disable double-tap to zoom, we want double-clicking in the Mac to
     take precedence. */
     touch-action: none;
 }
@@ -90,6 +121,8 @@ view the screen will still be visible. */
 
 .Mac-Drag-Overlay.Mac-Drag-Overlay-Downloads:after {
     content: "Disk images will be mounted, files will be placed in the “Downloads” folder in “The Outside World”.";
+    max-width: 480px;
+    text-align: center;
 }
 
 .Mac-Ethernet-Status {

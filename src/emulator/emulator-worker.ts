@@ -16,6 +16,7 @@ import {
     isDiskImageFile,
     ethernetMacAddressFromString,
     InputBufferAddresses,
+    isCDROMBinFile,
 } from "./emulator-common";
 import {
     type EmulatorWorkerAudio,
@@ -35,9 +36,9 @@ import {
 import {
     type EmulatorWorkerFiles,
     FallbackEmulatorWorkerFiles,
+    getUploadData,
     SharedMemoryEmulatorWorkerFiles,
 } from "./emulator-worker-files";
-import {createLazyFile} from "./emulator-worker-lazy-file";
 import {
     handleExtractionRequests,
     initializeExtractor,
@@ -55,19 +56,26 @@ import {
     FallbackEmulatorWorkerClipboard,
     SharedMemoryEmulatorWorkerClipboard,
 } from "./emulator-worker-clipboard";
-import {EmulatorWorkerDisksApi} from "./emulator-worker-disks";
-import {EmulatorWorkerUploadDisk} from "./emulator-worker-upload-disk";
-import {createEmulatorWorkerCDROMDisk} from "./emulator-worker-cdrom-disk";
 import {
-    importEmulator,
-    importEmulatorFallback,
-} from "./emulator-worker-emulators";
+    type EmulatorWorkerDisk,
+    EmulatorWorkerDisksApi,
+} from "./emulator-worker-disks";
+import {EmulatorWorkerUploadDisk} from "./emulator-worker-upload-disk";
+import {
+    createEmulatorWorkerCDROMDisk,
+    EmulatorWorkerMode1SectorDisk,
+} from "./emulator-worker-cdrom-disk";
+import {importEmulator} from "./emulator-worker-emulators";
 import {
     EmulatorWorkerDiskSaver,
     initDiskSavers,
 } from "./emulator-worker-disk-saver";
-import {emulatorNeedsDeviceImage} from "./emulator-common-emulators";
+import {
+    emulatorNeedsDeviceImage,
+    type EmulatorSpeed,
+} from "./emulator-common-emulators";
 import {EmulatorWorkerDeviceImageDisk} from "./emulator-worker-device-image-disk";
+import {EmulatorWorkerSpeedGovernor} from "./emulator-worker-speed-governor";
 
 addEventListener("message", async event => {
     const {data} = event;
@@ -77,7 +85,7 @@ addEventListener("message", async event => {
     }
 });
 
-addEventListener("unhandledrejection", event => {
+addEventListener("unhandledrejection", (event: PromiseRejectionEvent) => {
     const reasonString = event.reason.toString();
     if (reasonString.toLowerCase().includes("out of memory")) {
         postMessage({type: "emulator_did_run_out_memory"});
@@ -97,6 +105,7 @@ class EmulatorWorkerApi {
     #files: EmulatorWorkerFiles;
     #ethernet: EmulatorWorkerEthernet;
     #clipboard: EmulatorWorkerClipboard;
+    #speedGovernor?: EmulatorWorkerSpeedGovernor;
 
     #videoOpenTime = 0;
     #lastBlitFrameId = 0;
@@ -125,7 +134,9 @@ class EmulatorWorkerApi {
             clipboard: clipboardConfig,
             disks,
             delayedDisks,
+            diskFiles,
             cdroms,
+            speedGovernorTargetIPS,
         } = config;
         const blitSender = (
             data: EmulatorWorkerVideoBlit,
@@ -136,9 +147,7 @@ class EmulatorWorkerApi {
 
         let fallbackEndpoint: EmulatorFallbackEndpoint | undefined;
         function getFallbackEndpoint(): EmulatorFallbackEndpoint {
-            if (!fallbackEndpoint) {
-                fallbackEndpoint = new EmulatorFallbackEndpoint();
-            }
+            fallbackEndpoint ??= new EmulatorFallbackEndpoint(config.workerId);
             return fallbackEndpoint;
         }
 
@@ -179,18 +188,36 @@ class EmulatorWorkerApi {
                       getFallbackEndpoint()
                   );
 
+        const needsDeviceImage = emulatorNeedsDeviceImage(config.emulatorType);
         this.disks = new EmulatorWorkerDisksApi(
             [
                 ...disks.map(spec => {
+                    let disk;
                     if (spec.persistent) {
                         const saver = new EmulatorWorkerDiskSaver(spec, this);
                         this.#diskSavers.push(saver);
-                        return new EmulatorWorkerChunkedDisk(spec, saver);
+                        disk = new EmulatorWorkerChunkedDisk(spec, saver);
+                    } else {
+                        disk = new EmulatorWorkerChunkedDisk(spec, this);
                     }
-                    const disk = new EmulatorWorkerChunkedDisk(spec, this);
                     if (
-                        emulatorNeedsDeviceImage(config.emulatorType) &&
-                        !spec.isFloppy
+                        needsDeviceImage &&
+                        !spec.isFloppy &&
+                        !spec.hasDeviceImageHeader
+                    ) {
+                        return new EmulatorWorkerDeviceImageDisk(
+                            disk,
+                            config.deviceImageHeader
+                        );
+                    }
+                    return disk;
+                }),
+                ...diskFiles.map(spec => {
+                    const disk = new EmulatorWorkerUploadDisk(spec, this);
+                    if (
+                        needsDeviceImage &&
+                        !spec.isCDROM &&
+                        !spec.hasDeviceImageHeader
                     ) {
                         return new EmulatorWorkerDeviceImageDisk(
                             disk,
@@ -203,15 +230,38 @@ class EmulatorWorkerApi {
                     createEmulatorWorkerCDROMDisk(spec, this)
                 ),
             ],
-            config.useCDROM,
+            config.usePlaceholderDisks,
             this.#emscriptenModule
         );
         this.#delayedDiskSpecs = delayedDisks;
+        if (speedGovernorTargetIPS !== undefined) {
+            this.#speedGovernor = new EmulatorWorkerSpeedGovernor(
+                speedGovernorTargetIPS
+            );
+        }
+    }
+
+    #abortError?: string;
+    setAbortError(error: string) {
+        this.#abortError = error;
+    }
+
+    emulatorDidHaveError(status: number, toThrow?: Error) {
+        if (toThrow) {
+            console.error(toThrow);
+        }
+        let error = toThrow
+            ? toThrow.message || toThrow.toString()
+            : `Exit status ${status}`;
+        if (this.#abortError && error.toLowerCase().includes("aborted")) {
+            error = this.#abortError;
+            this.#abortError = undefined;
+        }
+        postMessage({type: "emulator_did_have_error", error});
     }
 
     exit() {
-        this.#handleStop();
-        postMessage({type: "emulator_exit"});
+        this.#handleStop(true);
         for (;;) {
             // Don't let the process keep executing (it will exit with a non-0
             // status code), instead wait for the worker to be terminated.
@@ -313,7 +363,9 @@ class EmulatorWorkerApi {
     }
 
     #sleep(timeSeconds: number) {
-        this.#input.idleWait(timeSeconds * 1000);
+        if (timeSeconds) {
+            this.#input.idleWait(timeSeconds * 1000);
+        }
 
         if (this.#lastIdleWaitFrameId !== this.#lastBlitFrameId) {
             this.#lastIdleWaitFrameId = this.#lastBlitFrameId;
@@ -369,9 +421,16 @@ class EmulatorWorkerApi {
     #handleFileRequests() {
         const {uploads, cdroms} = this.#files.consumeRequests();
         for (const upload of uploads) {
-            const isDiskImage = isDiskImageFile(upload.name);
+            const isDiskImage = isDiskImageFile(upload);
             if (isDiskImage) {
-                this.disks.addDisk(new EmulatorWorkerUploadDisk(upload, this));
+                let disk: EmulatorWorkerDisk = new EmulatorWorkerUploadDisk(
+                    upload,
+                    this
+                );
+                if (isCDROMBinFile(upload)) {
+                    disk = new EmulatorWorkerMode1SectorDisk(disk);
+                }
+                this.disks.addDisk(disk);
             } else {
                 this.#handleFileUpload(upload);
             }
@@ -395,19 +454,39 @@ class EmulatorWorkerApi {
             parent += pathPieces.slice(0, pathPieces.length - 1).join("/");
             name = pathPieces[pathPieces.length - 1];
         }
-        createLazyFile(parent, name, upload.url, upload.size, true, true);
+        const contents = getUploadData(upload);
+        FS.createDataFile(
+            parent,
+            name,
+            contents,
+            true, // canRead
+            true, // canWrite
+            true // canOwn - no need for another copy
+        );
     }
 
-    #handleStop() {
+    #handleStop(isExit = false) {
         if (this.#handledStop) {
             return;
         }
         this.#closeDiskSavers();
         this.#handledStop = true;
-        postMessage({type: "emulator_stopped"});
+        postMessage({type: "emulator_stopped", isExit});
     }
 
-    acquireInputLock(): number {
+    acquireInputLock(instructionCount?: number) {
+        if (this.#speedGovernor && instructionCount !== undefined) {
+            if (this.getInputValue(InputBufferAddresses.speedFlagAddr)) {
+                const speed = this.getInputValue(
+                    InputBufferAddresses.speedAddr
+                );
+                this.#speedGovernor.setSpeed(speed as EmulatorSpeed);
+            }
+            const sleepTimeMs = this.#speedGovernor.update(instructionCount);
+            if (sleepTimeMs > 0) {
+                this.#input.sleep(sleepTimeMs);
+            }
+        }
         return this.#input.acquireInputLock();
     }
 
@@ -495,7 +574,14 @@ class EmulatorWorkerApi {
 }
 
 export class EmulatorFallbackEndpoint {
+    #workerId: string;
     #commandQueue: EmulatorFallbackCommand[] = [];
+    #fetchFailures = 0;
+    #loggedMaxFetchFailures = false;
+
+    constructor(workerId: string) {
+        this.#workerId = workerId;
+    }
 
     idleWait(timeout: number) {
         this.#fetchSync(`./worker-idlewait?timeout=${timeout}&t=${Date.now()}`);
@@ -567,8 +653,20 @@ export class EmulatorFallbackEndpoint {
     }
 
     #fetchSync(url: string): any | undefined {
+        // Don't keep trying to fetch if it's failing. That likely means that
+        // the service worker was not registered or activated, and these
+        // requests are hitting the server directly, which we don't want.
+        if (this.#fetchFailures > 100) {
+            if (!this.#loggedMaxFetchFailures) {
+                console.error(
+                    "Too many fetch failures, disabling fallback endpoint"
+                );
+                this.#loggedMaxFetchFailures = true;
+            }
+            return undefined;
+        }
         const xhr = new XMLHttpRequest();
-        xhr.open("GET", url, false);
+        xhr.open("GET", url + `&worker-id=${this.#workerId}`, false);
         xhr.send(null);
         if (xhr.status !== 200) {
             console.warn(
@@ -577,12 +675,16 @@ export class EmulatorFallbackEndpoint {
                 xhr.status,
                 xhr.statusText
             );
+            this.#fetchFailures++;
             return undefined;
         }
         try {
-            return JSON.parse(xhr.responseText);
+            const value = JSON.parse(xhr.responseText);
+            this.#fetchFailures = 0;
+            return value;
         } catch (err) {
             console.warn("Could not parse JSON", err, xhr.responseText);
+            this.#fetchFailures++;
         }
     }
 }
@@ -592,11 +694,64 @@ async function startEmulator(config: EmulatorWorkerConfig) {
         workerApi?: EmulatorWorkerApi;
     } = {
         arguments: config.arguments,
-        locateFile(path: string, scriptDirectory: string) {
-            if (path.endsWith(".wasm")) {
-                return config.wasmUrl;
+
+        instantiateWasm(imports, successCallback) {
+            const {dateOffset} = config;
+            if (dateOffset) {
+                let overrodeDateFunctions = false;
+                for (const moduleImports of Object.values(imports)) {
+                    // Emscripten 3.1.73 and earlier end up accessing the current
+                    // time through an exported emscripten_date_now function,
+                    // so we can just override that.
+                    if ("emscripten_date_now" in moduleImports) {
+                        moduleImports["emscripten_date_now"] = () => {
+                            return Date.now() + dateOffset;
+                        };
+                        overrodeDateFunctions = true;
+                    }
+                    // From Emscripten 3.1.74 onwards, emscripten_date_now is
+                    // still used but it's not exposed via moduleImports, so we
+                    // need to override the slightly higher level clock_time_get
+                    // function. It writes the return value into the heap, which
+                    // we can't easily access from here, so it's easier to
+                    // monkey-patch Date.now while it runs.
+                    const originalClockTimeGet =
+                        moduleImports["clock_time_get"];
+                    if (originalClockTimeGet instanceof Function) {
+                        const originalDateNow = Date.now;
+                        moduleImports["clock_time_get"] = (...args: any[]) => {
+                            const offsetNow = originalDateNow() + dateOffset;
+                            Date.now = () => offsetNow;
+                            const rv = originalClockTimeGet(...args);
+                            Date.now = originalDateNow;
+                            return rv;
+                        };
+                        overrodeDateFunctions = true;
+                    }
+                }
+                if (!overrodeDateFunctions) {
+                    console.warn(
+                        "Neither emscripten_date_now or clock_time_get were found to override, time may be incorrect"
+                    );
+                }
             }
-            return scriptDirectory + path;
+            WebAssembly.instantiateStreaming(
+                new Response(config.wasm, {
+                    headers: {"Content-Type": "application/wasm"},
+                }),
+                imports
+            )
+                .then(output => successCallback(output.instance))
+                .catch(error => {
+                    console.error(error);
+                    postMessage({
+                        type: "emulator_did_have_error",
+                        error: `Cannot instantiate WebAssembly: ${error.toString()}\n${
+                            error.stack
+                        }`,
+                    });
+                });
+            return {};
         },
 
         preRun: [
@@ -612,9 +767,20 @@ async function startEmulator(config: EmulatorWorkerConfig) {
                 for (const [name, buffer] of Object.entries(
                     config.autoloadFiles
                 )) {
+                    const path = name.split("/");
+                    const fileName = path[path.length - 1];
+                    const parentPath = [];
+                    let parent = "/";
+                    for (const dir of path.slice(0, path.length - 1)) {
+                        parentPath.push(dir);
+                        parent = "/" + parentPath.join("/");
+                        if (!FS.analyzePath(parent).exists) {
+                            FS.mkdir(parent);
+                        }
+                    }
                     FS.createDataFile(
-                        "/",
-                        name,
+                        parent,
+                        fileName,
                         new Uint8Array(buffer),
                         true,
                         true,
@@ -653,13 +819,10 @@ async function startEmulator(config: EmulatorWorkerConfig) {
             if (status === 0) {
                 moduleOverrides.workerApi?.exit();
             } else {
-                console.error(toThrow);
-                postMessage({
-                    type: "emulator_did_have_error",
-                    error: toThrow
-                        ? toThrow.message || toThrow.toString()
-                        : `Exit status ${status}`,
-                });
+                moduleOverrides.workerApi?.emulatorDidHaveError(
+                    status,
+                    toThrow
+                );
             }
         },
     };
@@ -685,11 +848,6 @@ async function startEmulator(config: EmulatorWorkerConfig) {
     try {
         runEmulatorModule(await importEmulator(config));
     } catch (error) {
-        console.log("Could not import emulator, will try fallback mode", error);
-        try {
-            runEmulatorModule(await importEmulatorFallback(config));
-        } catch (error) {
-            postMessage({type: "emulator_did_have_error", error});
-        }
+        postMessage({type: "emulator_did_have_error", error});
     }
 }

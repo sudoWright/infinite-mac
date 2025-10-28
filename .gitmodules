@@ -14,3 +14,9 @@
 [submodule "dingusppc"]
 	path = dingusppc
 	url = https://github.com/mihaip/dingusppc
+[submodule "previous"]
+	path = previous
+	url = https://github.com/mihaip/previous
+[submodule "pearpc"]
+	path = pearpc
+	url = https://github.com/mihaip/pearpc

@@ -2,9 +2,27 @@ export type EmulatorType =
     | "BasiliskII"
     | "SheepShaver"
     | "Mini vMac"
-    | "DingusPPC";
+    | "DingusPPC"
+    | "Previous"
+    | "PearPC";
 
-export type EmulatorSubtype = "128K" | "512Ke" | "Plus" | "SE" | "II";
+export type EmulatorMinivMacSubtypes =
+    | "128K"
+    | "512Ke"
+    | "Plus"
+    | "SE"
+    | "II"
+    | "IIx";
+
+export type EmulatorPreviousSubtypes =
+    | "NeXT Computer"
+    | "NeXTcube"
+    | "NeXTstation"
+    | "NeXTstation Turbo Color";
+
+export type EmulatorSubtype =
+    | EmulatorMinivMacSubtypes
+    | EmulatorPreviousSubtypes;
 
 export type EmulatorCpu =
     | "68000"
@@ -16,38 +34,45 @@ export type EmulatorCpu =
     | "604"
     | "G3";
 
-export const EMULATOR_CD_DRIVE_COUNT = 7;
+export const EMULATOR_REMOVABLE_DISK_COUNT = 7;
 
-export function emulatorUsesPrefs(type: EmulatorType): boolean {
-    return type !== "DingusPPC";
-}
-
-export function emulatorUsesArgs(type: EmulatorType): boolean {
-    return type === "DingusPPC";
-}
-
-export function emulatorUsesCDROMDrive(type: EmulatorType): boolean {
+export function emulatorUsesPlaceholderDisks(type: EmulatorType): boolean {
     return type === "BasiliskII" || type === "SheepShaver";
 }
 
 export function emulatorSupportsSpeedSetting(type: EmulatorType): boolean {
-    return type === "Mini vMac";
+    return type === "Mini vMac" || type === "BasiliskII";
+}
+
+// True if the emulator can optionally use mouse deltas instead of absolute
+// coordinates (separate from emulatorNeedsMouseDeltas, those emulators always
+// use deltas).
+export function emulatorSupportsMouseDeltas(type: EmulatorType): boolean {
+    return type === "BasiliskII" || type === "SheepShaver";
+}
+
+export function emulatorNeedsMouseDeltas(type: EmulatorType): boolean {
+    return type === "DingusPPC" || type === "Previous" || type === "PearPC";
 }
 
 export function emulatorSupportsAppleTalk(type: EmulatorType): boolean {
     return type === "BasiliskII" || type === "SheepShaver";
 }
 
-export function emulatorNeedsPointerLock(type: EmulatorType): boolean {
-    return type === "DingusPPC";
-}
-
 export function emulatorSupportsDownloadsFolder(type: EmulatorType): boolean {
     return type === "BasiliskII" || type === "SheepShaver";
 }
 
+export function emulatorSupportsCDROMs(type: EmulatorType): boolean {
+    return type !== "DingusPPC" && type !== "PearPC";
+}
+
 export function emulatorNeedsDeviceImage(type: EmulatorType): boolean {
-    return type === "DingusPPC";
+    return type === "DingusPPC" || type === "PearPC";
+}
+
+export function emulatorSupportsDebugLog(type: EmulatorType): boolean {
+    return type === "DingusPPC" || type === "Previous" || type === "PearPC";
 }
 
 export function emulatorCpuId(
@@ -94,7 +119,16 @@ export const EMULATOR_SPEEDS = new Map<EmulatorSpeed, string>([
     [-1, "All Out"],
 ]);
 
-export type EmulatorDef = {
-    emulatorType: EmulatorType;
-    emulatorSubtype?: EmulatorSubtype;
-};
+export type EmulatorDef =
+    | {
+          emulatorType: Exclude<EmulatorType, "Mini vMac" | "Previous">;
+          emulatorSubtype?: never;
+      }
+    | {
+          emulatorType: "Mini vMac";
+          emulatorSubtype: EmulatorMinivMacSubtypes;
+      }
+    | {
+          emulatorType: "Previous";
+          emulatorSubtype: EmulatorPreviousSubtypes;
+      };

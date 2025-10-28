@@ -1,11 +1,14 @@
-import React, {useEffect, useState, useRef, useCallback} from "react";
+import React, {useEffect, useState, useRef, useCallback, useMemo} from "react";
 import "./Mac.css";
 import {
     type EmulatorEthernetProvider,
     type EmulatorEthernetPeer,
-    type EmulatorSettings,
     Emulator,
 } from "./emulator/emulator-ui";
+import {
+    type EmulatorSettings,
+    DEFAULT_EMULATOR_SETTINGS,
+} from "./emulator/emulator-ui-settings";
 import {type EmulatorCDROM, isDiskImageFile} from "./emulator/emulator-common";
 import {useDevicePixelRatio} from "./useDevicePixelRatio";
 import {usePersistentState} from "./usePersistentState";
@@ -21,10 +24,17 @@ import {
     type SystemDiskDef,
     INFINITE_HD,
     INFINITE_HD_MFS,
+    INFINITE_HD_NEXT,
     SAVED_HD,
     INFINITE_HD6,
+    type DiskFile,
+    INFINITE_HDX,
 } from "./disks";
-import {type MachineDefRAMSize, type MachineDef} from "./machines";
+import {
+    type MachineDefRAMSize,
+    type MachineDef,
+    DEFAULT_SUPPORTED_SCREEN_SIZES,
+} from "./machines";
 import classNames from "classnames";
 import {MacCDROMs} from "./MacCDROMs";
 import {getCDROMInfo} from "./cdroms";
@@ -36,22 +46,49 @@ import {
     resetDiskSaver,
     saveDiskSaverImage,
 } from "./emulator/emulator-ui-disk-saver";
-import {type Appearance} from "./controls/Appearance";
-import {emulatorSupportsDownloadsFolder} from "./emulator/emulator-common-emulators";
+import {
+    emulatorNeedsMouseDeltas,
+    emulatorSupportsCDROMs,
+    emulatorSupportsDownloadsFolder,
+} from "./emulator/emulator-common-emulators";
+import {type ScreenSize} from "./run-def";
+import {viewTransitionNameForDisk} from "./view-transitions";
+import {DrawersContainer} from "./controls/Drawer";
+import {
+    handleLibraryURL,
+    MacLibrary,
+    preloadMacLibraryContents,
+} from "./MacLibrary";
+import {
+    type EmbedNotificationEvent,
+    type EmbedControlEvent,
+} from "./embed-types";
 
 export type MacProps = {
     disks: SystemDiskDef[];
     includeInfiniteHD: boolean;
     includeSavedHD: boolean;
+    includeLibrary: boolean;
+    libraryDownloadURLs: string[];
+    diskFiles: DiskFile[];
     cdroms: EmulatorCDROM[];
     initialErrorText?: string;
     machine: MachineDef;
     ramSize?: MachineDefRAMSize;
+    screenSize: ScreenSize;
+    screenScale?: number;
+    screenUpdateMessages?: boolean;
+    startPaused?: boolean;
+    autoPause?: boolean;
+    listenForControlMessages?: boolean;
     ethernetProvider?: EmulatorEthernetProvider;
+    customDate?: Date;
     debugFallback?: boolean;
     debugAudio?: boolean;
     debugPaused?: boolean;
     debugLog?: boolean;
+    debugTrackpad?: boolean;
+    emulatorSettings?: EmulatorSettings;
     onDone: () => void;
 };
 
@@ -59,24 +96,41 @@ export default function Mac({
     disks,
     includeInfiniteHD,
     includeSavedHD,
+    includeLibrary,
+    libraryDownloadURLs,
+    diskFiles,
     cdroms,
     initialErrorText,
     machine,
     ramSize,
+    screenSize: screenSizeProp,
+    screenScale: screenScaleProp,
+    startPaused,
+    autoPause,
+    listenForControlMessages,
+    screenUpdateMessages,
     ethernetProvider,
+    customDate,
     debugFallback,
     debugAudio,
     debugPaused,
     debugLog,
+    debugTrackpad,
+    emulatorSettings: fixedEmulatorSettings,
     onDone,
 }: MacProps) {
     const screenRef = useRef<HTMLCanvasElement>(null);
     const [emulatorLoaded, setEmulatorLoaded] = useState(false);
-    const [scale, setScale] = useState<number | undefined>(undefined);
+    const [scale, setScale] = useState<number | undefined>(screenScaleProp);
     const [fullscreen, setFullscreen] = useState(false);
     const [emulatorLoadingProgress, setEmulatorLoadingProgress] = useState([
         0, 0,
     ]);
+    const [emulatorFileLoadingProgress, setEmulatorFileLoadingProgress] =
+        useState<{fraction: number; name: string; linger?: boolean}>({
+            name: "",
+            fraction: 1.0,
+        });
     const [emulatorLoadingDiskChunk, setEmulatorLoadingDiskChunk] =
         useState(false);
     const [emulatorErrorText, setEmulatorErrorText] =
@@ -93,7 +147,12 @@ export default function Mac({
     const onEmulatorSettingsChange = useCallback(() => {
         emulatorRef.current?.refreshSettings();
     }, []);
-    const [emulatorSettings, setEmulatorSettings] = usePersistentState(
+    // Hacky way to have a conditional hook without violating the rules of hooks
+    // (in practice the fixedEmulatorSettings prop never changes, so this is fine).
+    const useEmulatorSettingsHook = fixedEmulatorSettings
+        ? () => [fixedEmulatorSettings, () => {}] as const
+        : usePersistentState;
+    const [emulatorSettings, setEmulatorSettings] = useEmulatorSettingsHook(
         DEFAULT_EMULATOR_SETTINGS,
         "emulator-settings",
         onEmulatorSettingsChange
@@ -101,7 +160,11 @@ export default function Mac({
     const emulatorSettingsRef = useRef(emulatorSettings);
     emulatorSettingsRef.current = emulatorSettings;
 
-    const initialScreenSize = machine.fixedScreenSize ?? SCREEN_SIZE_FOR_WINDOW;
+    const initialScreenSize = useMemo(
+        () =>
+            computeInitialScreenSize(machine, screenSizeProp, screenScaleProp),
+        [machine, screenSizeProp, screenScaleProp]
+    );
     const {width: initialScreenWidth, height: initialScreenHeight} =
         initialScreenSize;
     const [screenSize, setScreenSize] = useState(initialScreenSize);
@@ -109,22 +172,62 @@ export default function Mac({
 
     const hasSavedHD = includeSavedHD && canSaveDisks();
 
-    useEffect(() => {
-        document.addEventListener("fullscreenchange", handleFullScreenChange);
-        document.addEventListener(
-            "webkitfullscreenchange",
-            handleFullScreenChange
-        );
+    const handleMacLibraryProgress = useCallback(
+        (name: string, fraction: number) => {
+            setEmulatorFileLoadingProgress({
+                name,
+                fraction,
+            });
+        },
+        []
+    );
+    const handleMacLibraryRun = useCallback((file: File) => {
+        const emulator = emulatorRef.current;
+        if (emulator) {
+            setEmulatorFileLoadingProgress({
+                name: file.name,
+                fraction: 1.0,
+                linger: true,
+            });
+            uploadFiles(emulator, [file], undefined, {fromLibrary: true});
+            setTimeout(
+                () =>
+                    setEmulatorFileLoadingProgress({
+                        name: file.name,
+                        fraction: 1.0,
+                    }),
+                1000
+            );
+        }
+    }, []);
 
+    const {emulatorType} = machine;
+    const canLoadFiles =
+        emulatorSupportsDownloadsFolder(emulatorType) ||
+        emulatorSupportsCDROMs(emulatorType);
+
+    useEffect(() => {
         const emulatorDisks: EmulatorDiskDef[] = [...disks];
         const delayedDisks: EmulatorDiskDef[] = [];
         if (includeInfiniteHD) {
-            const infiniteHd =
-                disks[0]?.infiniteHdSubset === "mfs" || machine.mfsOnly
-                    ? INFINITE_HD_MFS
-                    : disks[0]?.infiniteHdSubset === "system6"
-                    ? INFINITE_HD6
-                    : INFINITE_HD;
+            let infiniteHd;
+            if (machine.platform === "NeXT") {
+                infiniteHd = INFINITE_HD_NEXT;
+            } else if (
+                disks[0]?.infiniteHdSubset === "mfs" ||
+                machine.mfsOnly
+            ) {
+                infiniteHd = INFINITE_HD_MFS;
+            } else if (
+                disks[0]?.infiniteHdSubset === "system6" ||
+                (disks.length === 0 && emulatorType === "Mini vMac")
+            ) {
+                infiniteHd = INFINITE_HD6;
+            } else if (disks[0]?.infiniteHdSubset === "macosx") {
+                infiniteHd = INFINITE_HDX;
+            } else {
+                infiniteHd = INFINITE_HD;
+            }
             if (disks[0]?.delayAdditionalDiskMount) {
                 delayedDisks.push(infiniteHd);
             } else {
@@ -134,8 +237,17 @@ export default function Mac({
         if (hasSavedHD) {
             emulatorDisks.push(SAVED_HD);
         }
-        const useSharedMemory =
-            typeof SharedArrayBuffer !== "undefined" && !debugFallback;
+        const hasSharedArrayBuffer = typeof SharedArrayBuffer !== "undefined";
+        if (!hasSharedArrayBuffer) {
+            console.warn(
+                "SharedArrayBuffer is not available, fallback more will be used. Performance may be degraded."
+            );
+        }
+        const useSharedMemory = hasSharedArrayBuffer && !debugFallback;
+        const sendEmbedNotification = (event: EmbedNotificationEvent) => {
+            window.parent.postMessage(event, "*");
+        };
+
         const emulator = new Emulator(
             {
                 machine,
@@ -145,11 +257,22 @@ export default function Mac({
                 screenHeight: initialScreenHeight,
                 screenCanvas: screenRef.current!,
                 disks: emulatorDisks,
+                diskFiles: diskFiles.map(df => ({
+                    name: df.file.name,
+                    url: URL.createObjectURL(df.file),
+                    size: df.file.size,
+                    isCDROM: df.treatAsCDROM,
+                    hasDeviceImageHeader: df.hasDeviceImageHeader,
+                })),
                 delayedDisks,
                 cdroms,
                 ethernetProvider,
+                customDate,
+                startPaused,
+                autoPause,
                 debugAudio,
                 debugLog,
+                debugTrackpad,
             },
             {
                 emulatorDidExit(emulator: Emulator) {
@@ -161,6 +284,18 @@ export default function Mac({
                 emulatorDidFinishLoading(emulator: Emulator) {
                     setEmulatorLoaded(true);
                     emulator.refreshSettings();
+                    if (emulatorSupportsDownloadsFolder(emulatorType)) {
+                        libraryDownloadURLs.forEach(url =>
+                            handleLibraryURL(
+                                url,
+                                handleMacLibraryRun,
+                                handleMacLibraryProgress
+                            )
+                        );
+                    }
+                    if (listenForControlMessages) {
+                        sendEmbedNotification({type: "emulator_loaded"});
+                    }
                 },
                 emulatorDidMakeLoadingProgress(
                     emulator: Emulator,
@@ -181,6 +316,11 @@ export default function Mac({
                         window.setTimeout(() => {
                             setEmulatorLoadingDiskChunk(false);
                         }, 200);
+                },
+                emulatorDidBecomeQuiescent(emulator: Emulator) {
+                    // Preload the library once we know it won't compete with
+                    // the emulator boot for network resources.
+                    preloadMacLibraryContents();
                 },
                 emulatorEthernetPeersDidChange(emulator, peers) {
                     if (ethernetProvider) {
@@ -216,7 +356,10 @@ export default function Mac({
                             );
                         }
                     } else {
-                        varz.incrementError("emulator_error:other", errorRaw);
+                        varz.incrementError(
+                            `emulator_error:${emulatorType}:other`,
+                            errorRaw
+                        );
                     }
                     setEmulatorErrorText(
                         `The emulator encountered an error:\n\n${error}`
@@ -224,6 +367,24 @@ export default function Mac({
                 },
                 emulatorSettings(emulator) {
                     return emulatorSettingsRef.current;
+                },
+                emulatorDidMakeCDROMLoadingProgress(emulator, cdrom, fraction) {
+                    setEmulatorFileLoadingProgress({name: "CD-ROM", fraction});
+                },
+                emulatorDidDrawScreen(emulator, imageData) {
+                    if (screenUpdateMessages) {
+                        const data = imageData.data;
+                        // Make sure the alpha channel is fully opaque.
+                        for (let i = 3; i < data.length; i += 4) {
+                            data[i] = 255;
+                        }
+                        sendEmbedNotification({
+                            type: "emulator_screen",
+                            data,
+                            width: imageData.width,
+                            height: imageData.height,
+                        });
+                    }
                 },
             }
         );
@@ -235,8 +396,9 @@ export default function Mac({
 
         const startVarz = {
             "emulator_starts": 1,
+            "emulator_embedded": screenSizeProp === "embed" ? 1 : 0,
             "emulator_ethernet": ethernetProvider ? 1 : 0,
-            [`emulator_type:${machine.emulatorType}`]: 1,
+            [`emulator_type:${emulatorType}`]: 1,
 
             "emulator_shared_memory": useSharedMemory ? 1 : 0,
         };
@@ -250,45 +412,122 @@ export default function Mac({
         }
         varz.incrementMulti(startVarz);
 
+        let messageListener: (e: MessageEvent) => void;
+        if (listenForControlMessages) {
+            messageListener = e => {
+                if (e.source !== window.parent || window.parent === window) {
+                    return;
+                }
+                const event = e.data as EmbedControlEvent;
+                switch (event.type) {
+                    case "emulator_pause":
+                        emulator.pause();
+                        break;
+                    case "emulator_unpause":
+                        emulator.unpause();
+                        break;
+                    case "emulator_mouse_move": {
+                        const {x, y, deltaX, deltaY} = event;
+                        emulator.handleExternalInput({
+                            type: "mousemove",
+                            x,
+                            y,
+                            deltaX,
+                            deltaY,
+                        });
+                        break;
+                    }
+                    case "emulator_mouse_down":
+                        emulator.handleExternalInput({
+                            type: "mousedown",
+                            button: event.button,
+                        });
+                        break;
+                    case "emulator_mouse_up":
+                        emulator.handleExternalInput({
+                            type: "mouseup",
+                            button: event.button,
+                        });
+                        break;
+                    case "emulator_key_down":
+                        emulator.handleExternalInput({
+                            type: "keydown",
+                            code: event.code,
+                        });
+                        break;
+                    case "emulator_key_up":
+                        emulator.handleExternalInput({
+                            type: "keyup",
+                            code: event.code,
+                        });
+                        break;
+                    case "emulator_load_disk":
+                        getCDROMInfo(event.url)
+                            .then(cdrom => emulator.loadCDROM(cdrom))
+                            .catch(err =>
+                                console.error(
+                                    "Could not load CD-ROM",
+                                    event.url,
+                                    err
+                                )
+                            );
+                        break;
+                    default:
+                        console.warn("Unknown message from parent:", e.data);
+                        break;
+                }
+            };
+            window.addEventListener("message", messageListener);
+        }
+
         return () => {
-            document.removeEventListener(
-                "fullscreenchange",
-                handleFullScreenChange
-            );
-            document.removeEventListener(
-                "webkitfullscreenchange",
-                handleFullScreenChange
-            );
             emulator.stop();
             emulatorRef.current = undefined;
             ethernetProvider?.close?.();
+            if (messageListener) {
+                window.removeEventListener("message", messageListener);
+            }
         };
     }, [
         disks,
+        diskFiles,
         includeInfiniteHD,
         cdroms,
         machine,
+        emulatorType,
         ethernetProvider,
+        screenSizeProp,
         initialScreenWidth,
         initialScreenHeight,
+        customDate,
         debugFallback,
         debugAudio,
         debugPaused,
         debugLog,
+        debugTrackpad,
         hasSavedHD,
         ramSize,
         onDone,
+        libraryDownloadURLs,
+        handleMacLibraryRun,
+        handleMacLibraryProgress,
+        startPaused,
+        autoPause,
+        screenUpdateMessages,
+        listenForControlMessages,
     ]);
-    const {appearance = "Classic"} = disks[0] ?? {};
+
+    useEffect(() => {
+        document.body.classList.toggle("embed", screenSizeProp === "embed");
+    }, [screenSizeProp]);
 
     const handleFullScreenClick = () => {
         // Make the entire page go fullscreen (instead of just the screen
         // canvas) because iOS Safari does not maintain the aspect ratio of the
         // canvas.
-        document.body.requestFullscreen?.() ||
-            document.body.webkitRequestFullscreen?.();
+        document.body.requestFullscreen();
     };
-    const handleFullScreenChange = () => {
+    const handleFullScreenChange = useCallback(() => {
         const isFullScreen = Boolean(
             document.fullscreenElement ?? document.webkitFullscreenElement
         );
@@ -299,7 +538,7 @@ export default function Mac({
         }
 
         document.body.classList.toggle("fullscreen", isFullScreen);
-        if (isFullScreen) {
+        if (isFullScreen && screenSizeProp !== "fullscreen") {
             const heightScale =
                 window.screen.availHeight / screenRef.current!.height;
             const widthScale =
@@ -308,7 +547,24 @@ export default function Mac({
         } else {
             setScale(undefined);
         }
-    };
+    }, [screenSizeProp]);
+    useEffect(() => {
+        document.addEventListener("fullscreenchange", handleFullScreenChange);
+        document.addEventListener(
+            "webkitfullscreenchange",
+            handleFullScreenChange
+        );
+        return () => {
+            document.removeEventListener(
+                "fullscreenchange",
+                handleFullScreenChange
+            );
+            document.removeEventListener(
+                "webkitfullscreenchange",
+                handleFullScreenChange
+            );
+        };
+    }, [handleFullScreenChange]);
 
     const [settingsVisible, setSettingsVisible] = useState(false);
     const handleSettingsClick = () => {
@@ -322,11 +578,11 @@ export default function Mac({
             return;
         }
         // Bringing up the on-screen keyboard on iOS requires that the input
-        // is visible, but only for the focus request to be honored. We can
-        // hide it immediately after to avoid ending up with a blinking caret.
+        // is visible, and as of iOS 17, it needs to be on-screen at all times.
+        // We don't show it by default to avoid any unintended side effects from
+        // from it.
         input.style.visibility = "visible";
         input.focus();
-        input.style.removeProperty("visibility");
     };
     const handleStartClick = () => {
         emulatorRef.current?.start();
@@ -350,6 +606,86 @@ export default function Mac({
             );
         }
     }
+    if (
+        emulatorFileLoadingProgress &&
+        (emulatorFileLoadingProgress.fraction < 1.0 ||
+            emulatorFileLoadingProgress.linger)
+    ) {
+        progress = (
+            <div
+                className={classNames("Mac-Loading", {
+                    "Mac-Loading-Non-Modal": emulatorLoaded,
+                })}>
+                {emulatorFileLoadingProgress.fraction < 1.0 ? (
+                    <>
+                        Loading {emulatorFileLoadingProgress.name}…
+                        <span className="Mac-Loading-Fraction">
+                            {(
+                                emulatorFileLoadingProgress.fraction * 100
+                            ).toFixed(0)}
+                            %
+                        </span>
+                    </>
+                ) : (
+                    <>Loaded {emulatorFileLoadingProgress.name}</>
+                )}
+            </div>
+        );
+    }
+
+    const [showMacOSXSlowNotification, clearMacOSXSlowNotification] =
+        useTemporaryNotification(
+            !progress &&
+                emulatorLoaded &&
+                disks[0]?.infiniteHdSubset === "macosx",
+            "mac-os-x-slow-notification-count"
+        );
+    if (showMacOSXSlowNotification) {
+        progress = (
+            <div className="Mac-Loading Mac-Loading-Non-Modal Mac-Loading-OneLine">
+                <span
+                    className="Mac-Loading-Dismiss"
+                    onClick={clearMacOSXSlowNotification}>
+                    ⓧ
+                </span>
+                Mac OS X may take a minute or two to start up, please be
+                patient.
+            </div>
+        );
+    }
+
+    const [mouseHasMoved, setMouseHasMoved] = useState(false);
+    const [showPointerLockNotification, clearPointerLockNotification] =
+        useTemporaryNotification(
+            !progress &&
+                emulatorLoaded &&
+                mouseHasMoved &&
+                emulatorNeedsMouseDeltas(emulatorType) &&
+                !USING_TOUCH_INPUT,
+            "pointer-lock-notification-count"
+        );
+    if (showPointerLockNotification) {
+        progress = (
+            <div className="Mac-Loading Mac-Loading-Non-Modal Mac-Loading-OneLine">
+                <span
+                    className="Mac-Loading-Dismiss"
+                    onClick={clearPointerLockNotification}>
+                    ⓧ
+                </span>
+                Click the screen to lock the mouse for full control.
+            </div>
+        );
+    }
+    const handlePointerMove = useCallback(() => {
+        if (!mouseHasMoved) {
+            setMouseHasMoved(true);
+        }
+    }, [mouseHasMoved]);
+    const handlePointerDown = useCallback(() => {
+        if (showPointerLockNotification) {
+            clearPointerLockNotification();
+        }
+    }, [clearPointerLockNotification, showPointerLockNotification]);
 
     function handleDragStart(event: React.DragEvent) {
         // Don't allow the screen to be dragged off when using a touchpad on
@@ -369,9 +705,46 @@ export default function Mac({
         setDragCount(value => value - 1);
     }
 
+    const [hasUploadedResourceForks, setHasUploadedResourceForks] =
+        useState(false);
+    const handleResourceForkUpload = useCallback(() => {
+        setHasUploadedResourceForks(true);
+    }, []);
+    const [
+        showResourceForkUploadNotification,
+        clearResourceForkUploadNotification,
+    ] = useTemporaryNotification(
+        hasUploadedResourceForks,
+        "resource-fork-upload-notification-count"
+    );
+    if (showResourceForkUploadNotification) {
+        progress = (
+            <div className="Mac-Loading Mac-Loading-Non-Modal Mac-Loading-OneLine">
+                <span
+                    className="Mac-Loading-Dismiss"
+                    onClick={clearResourceForkUploadNotification}>
+                    ⓧ
+                </span>
+                To upload files with resource forks, zip them first (
+                <a
+                    href="https://blog.persistent.info/2025/09/infinite-mac-resource-forks.html"
+                    target="_blank">
+                    learn more
+                </a>
+                ).
+            </div>
+        );
+    }
+
     function handleDrop(event: React.DragEvent) {
         event.preventDefault();
         setDragCount(0);
+        if (!canLoadFiles) {
+            setEmulatorErrorText(
+                "This emulator does not support loading files."
+            );
+            return;
+        }
         const emulator = emulatorRef.current;
         if (!emulator) {
             return;
@@ -384,7 +757,8 @@ export default function Mac({
                 if (entry?.isDirectory) {
                     uploadDirectory(
                         emulator,
-                        entry as FileSystemDirectoryEntry
+                        entry as FileSystemDirectoryEntry,
+                        {onResourceForkUpload: handleResourceForkUpload}
                     );
                     return;
                 }
@@ -415,7 +789,9 @@ export default function Mac({
             }
         }
 
-        uploadFiles(emulator, files);
+        uploadFiles(emulator, files, undefined, {
+            onResourceForkUpload: handleResourceForkUpload,
+        });
     }
 
     function handleLoadFileClick() {
@@ -429,7 +805,14 @@ export default function Mac({
             // event if the user cancels the file picker.
             setDragCount(1);
             if (input.files && emulatorRef.current) {
-                uploadFiles(emulatorRef.current, Array.from(input.files));
+                uploadFiles(
+                    emulatorRef.current,
+                    Array.from(input.files),
+                    undefined,
+                    {
+                        onResourceForkUpload: handleResourceForkUpload,
+                    }
+                );
             }
             input.remove();
             // Delay removing the overlay a bit so that users have a chance to
@@ -440,10 +823,7 @@ export default function Mac({
     }
 
     function loadCDROM(cdrom: EmulatorCDROM) {
-        varz.incrementMulti({
-            "emulator_cdroms": 1,
-            [`emulator_cdrom:${cdrom.name}`]: 1,
-        });
+        varz.increment("emulator_cdroms", 1);
         emulatorRef.current?.loadCDROM(cdrom);
     }
 
@@ -465,12 +845,27 @@ export default function Mac({
             handler: onDone,
             alwaysVisible: true,
         },
-        {label: "Load File", handler: handleLoadFileClick},
+        ...(canLoadFiles
+            ? [{label: "Load File", handler: handleLoadFileClick}]
+            : []),
         {label: "Full Screen", handler: handleFullScreenClick},
         {label: "Settings", handler: handleSettingsClick},
     ];
-    if (NEEDS_KEYBOARD_BUTTON) {
+    if (USING_TOUCH_INPUT) {
         controls.push({label: "Keyboard", handler: handleKeyboardClick});
+        const alwaysUsingTrackpadMode =
+            emulatorNeedsMouseDeltas(emulatorType) ||
+            emulatorSettings.useMouseDeltas;
+        controls.push({
+            label: "Trackpad",
+            handler: () => {
+                setEmulatorSettings({
+                    ...emulatorSettings,
+                    trackpadMode: !emulatorSettings.trackpadMode,
+                });
+            },
+            selected: alwaysUsingTrackpadMode || emulatorSettings.trackpadMode,
+        });
     }
     if (debugPaused && !emulatorLoaded) {
         controls.splice(1, 0, {
@@ -481,107 +876,160 @@ export default function Mac({
     }
 
     const devicePixelRatio = useDevicePixelRatio();
+    let smoothScaling;
+    const {screenScaling = "auto"} = emulatorSettings;
+    switch (screenScaling) {
+        case "auto":
+            smoothScaling =
+                screenSizeProp === "auto" &&
+                (fullscreen ||
+                    devicePixelRatio !== Math.floor(devicePixelRatio));
+            break;
+        case "pixelated":
+            smoothScaling = false;
+            break;
+        case "smooth":
+            smoothScaling = true;
+            break;
+    }
     const screenClassName = classNames("Mac-Screen", {
-        "Mac-Screen-Smooth-Scaling":
-            fullscreen || devicePixelRatio !== Math.floor(devicePixelRatio),
+        "Mac-Screen-Smooth-Scaling": smoothScaling,
     });
 
     return (
-        <ScreenFrame
-            className="Mac"
-            bezelStyle={machine.bezelStyle}
-            bezelSize={bezelSize}
-            width={screenWidth}
-            height={screenHeight}
-            scale={scale}
-            fullscreen={fullscreen}
-            led={!emulatorLoaded || emulatorLoadingDiskChunk ? "Loading" : "On"}
-            onDragStart={handleDragStart}
-            onDragOver={handleDragOver}
-            onDragEnter={handleDragEnter}
-            onDragLeave={handleDragLeave}
-            onDrop={handleDrop}
-            controls={controls}
-            screen={
-                <>
-                    <canvas
-                        className={screenClassName}
-                        ref={screenRef}
-                        width={screenWidth}
-                        height={screenHeight}
-                        onContextMenu={e => e.preventDefault()}
-                    />
-                    {NEEDS_KEYBOARD_BUTTON && (
-                        <input
-                            type="text"
-                            className="Mac-Keyboard-Input"
-                            ref={keyboardInputRef}
+        <>
+            <ScreenFrame
+                className="Mac"
+                bezelStyle={machine.bezelStyle}
+                viewTransitionName={
+                    disks.length
+                        ? viewTransitionNameForDisk(disks[0])
+                        : undefined
+                }
+                bezelSize={bezelSize}
+                width={screenWidth}
+                height={screenHeight}
+                scale={scale}
+                fullscreen={
+                    fullscreen ||
+                    // These screen sizes always want fullscreen-like bezels
+                    screenSizeProp === "fullscreen" ||
+                    screenSizeProp === "window" ||
+                    screenSizeProp === "embed"
+                }
+                led={
+                    (!emulatorLoaded && !debugPaused) ||
+                    emulatorLoadingDiskChunk
+                        ? "Loading"
+                        : "On"
+                }
+                onDragStart={handleDragStart}
+                onDragOver={handleDragOver}
+                onDragEnter={handleDragEnter}
+                onDragLeave={handleDragLeave}
+                onDrop={handleDrop}
+                controls={controls}
+                screen={
+                    <>
+                        <canvas
+                            className={screenClassName}
+                            ref={screenRef}
+                            width={screenWidth}
+                            height={screenHeight}
+                            onContextMenu={e => e.preventDefault()}
+                            onPointerMove={handlePointerMove}
+                            onPointerDown={handlePointerDown}
                         />
-                    )}
-                </>
-            }>
-            {progress}
-            {dragCount > 0 && (
-                <div
-                    className={classNames("Mac-Overlay", "Mac-Drag-Overlay", {
-                        "Mac-Drag-Overlay-Downloads":
-                            emulatorSupportsDownloadsFolder(
-                                machine.emulatorType
-                            ),
-                    })}
-                />
+                        {USING_TOUCH_INPUT && (
+                            <input
+                                type="text"
+                                className="Mac-Keyboard-Input"
+                                ref={keyboardInputRef}
+                            />
+                        )}
+                    </>
+                }>
+                {progress}
+                {canLoadFiles && dragCount > 0 && (
+                    <div
+                        className={classNames(
+                            "Mac-Overlay",
+                            "Mac-Drag-Overlay",
+                            {
+                                "Mac-Drag-Overlay-Downloads":
+                                    emulatorSupportsDownloadsFolder(
+                                        emulatorType
+                                    ),
+                            }
+                        )}
+                    />
+                )}
+                {ethernetProviderRef.current && (
+                    <MacEthernetStatus
+                        provider={ethernetProviderRef.current}
+                        peers={ethernetPeers}
+                    />
+                )}
+                {settingsVisible && (
+                    <MacSettings
+                        emulatorType={emulatorType}
+                        emulatorSettings={emulatorSettings}
+                        setEmulatorSettings={setEmulatorSettings}
+                        hasSavedHD={hasSavedHD}
+                        onStorageReset={() => {
+                            varz.increment("emulator_disk_saver_reset");
+                            emulatorRef.current?.restart(() =>
+                                resetDiskSaver(SAVED_HD)
+                            );
+                        }}
+                        onStorageExport={() => {
+                            emulatorRef.current?.restart(() =>
+                                exportDiskSaver(SAVED_HD)
+                            );
+                            varz.increment("emulator_disk_saver_export");
+                        }}
+                        onStorageImport={() => {
+                            emulatorRef.current?.restart(() =>
+                                importDiskSaver(SAVED_HD)
+                            );
+                            varz.increment("emulator_disk_saver_import");
+                        }}
+                        onSaveImage={deviceImage => {
+                            emulatorRef.current?.restart(() =>
+                                saveDiskSaverImage(SAVED_HD, deviceImage)
+                            );
+                            varz.increment("emulator_disk_saver_save_image");
+                        }}
+                        onDone={() => setSettingsVisible(false)}
+                    />
+                )}
+                {emulatorErrorText && (
+                    <MacError
+                        text={emulatorErrorText}
+                        onDone={() => setEmulatorErrorText("")}
+                    />
+                )}
+            </ScreenFrame>
+            {!fullscreen && screenSizeProp !== "embed" && (
+                <DrawersContainer>
+                    {emulatorSupportsCDROMs(emulatorType) &&
+                        disks[0]?.infiniteHdSubset !== "mfs" && (
+                            <MacCDROMs
+                                onRun={loadCDROM}
+                                platform={machine.platform}
+                            />
+                        )}
+                    {includeLibrary &&
+                        emulatorSupportsDownloadsFolder(emulatorType) && (
+                            <MacLibrary
+                                onLoadProgress={handleMacLibraryProgress}
+                                onRun={handleMacLibraryRun}
+                                onRunCDROM={loadCDROM}
+                            />
+                        )}
+                </DrawersContainer>
             )}
-            {ethernetProviderRef.current && (
-                <MacEthernetStatus
-                    provider={ethernetProviderRef.current}
-                    peers={ethernetPeers}
-                />
-            )}
-            {settingsVisible && (
-                <MacSettings
-                    emulatorType={machine.emulatorType}
-                    emulatorSettings={emulatorSettings}
-                    appearance={appearance}
-                    setEmulatorSettings={setEmulatorSettings}
-                    hasSavedHD={hasSavedHD}
-                    onStorageReset={() => {
-                        varz.increment("emulator_disk_saver_reset");
-                        emulatorRef.current?.restart(() =>
-                            resetDiskSaver(SAVED_HD)
-                        );
-                    }}
-                    onStorageExport={() => {
-                        emulatorRef.current?.restart(() =>
-                            exportDiskSaver(SAVED_HD)
-                        );
-                        varz.increment("emulator_disk_saver_export");
-                    }}
-                    onStorageImport={() => {
-                        emulatorRef.current?.restart(() =>
-                            importDiskSaver(SAVED_HD)
-                        );
-                        varz.increment("emulator_disk_saver_import");
-                    }}
-                    onSaveImage={deviceImage => {
-                        emulatorRef.current?.restart(() =>
-                            saveDiskSaverImage(SAVED_HD, deviceImage)
-                        );
-                        varz.increment("emulator_disk_saver_save_image");
-                    }}
-                    onDone={() => setSettingsVisible(false)}
-                />
-            )}
-            {emulatorErrorText && (
-                <MacError
-                    appearance={appearance}
-                    text={emulatorErrorText}
-                    onDone={() => setEmulatorErrorText("")}
-                />
-            )}
-            {!fullscreen && disks[0]?.infiniteHdSubset !== "mfs" && (
-                <MacCDROMs onRun={loadCDROM} appearance={appearance} />
-            )}
-        </ScreenFrame>
+        </>
     );
 }
 
@@ -591,7 +1039,8 @@ export default function Mac({
  */
 function uploadDirectory(
     emulator: Emulator,
-    directoryEntry: FileSystemDirectoryEntry
+    directoryEntry: FileSystemDirectoryEntry,
+    options?: UploadFileOptions
 ) {
     let inProgressCount = 1; // we're waiting to read the starting directory
     const files: File[] = [];
@@ -605,7 +1054,7 @@ function uploadDirectory(
     const checkDone = () => {
         inProgressCount--;
         if (inProgressCount === 0) {
-            uploadFiles(emulator, files, names);
+            uploadFiles(emulator, files, names, options);
         }
     };
 
@@ -654,11 +1103,21 @@ function uploadDirectory(
     readDirectory(directoryEntry, [directoryEntry.name]);
 }
 
-function uploadFiles(emulator: Emulator, files: File[], names: string[] = []) {
+type UploadFileOptions = {
+    fromLibrary?: boolean;
+    onResourceForkUpload?: () => void;
+};
+
+function uploadFiles(
+    emulator: Emulator,
+    files: File[],
+    names: string[] = [],
+    {fromLibrary, onResourceForkUpload}: UploadFileOptions = {}
+) {
     let fileCount = 0;
     let diskImageCount = 0;
     for (const file of files) {
-        if (isDiskImageFile(file.name)) {
+        if (isDiskImageFile(file)) {
             diskImageCount++;
         } else {
             fileCount++;
@@ -667,45 +1126,67 @@ function uploadFiles(emulator: Emulator, files: File[], names: string[] = []) {
     const resourceForkCount = names.filter(name =>
         name.includes("/.rsrc/")
     ).length;
+    if (resourceForkCount) {
+        onResourceForkUpload?.();
+    }
     emulator.uploadFiles(files, names);
     varz.incrementMulti({
         "emulator_uploads": files.length,
         "emulator_uploads:files": fileCount,
         "emulator_uploads:disks": diskImageCount,
         "emulator_uploads:resource_forks": resourceForkCount,
+        "emulator_uploads:library": fromLibrary ? files.length : 0,
     });
 }
 
 const SMALL_BEZEL_THRESHOLD = 80;
 const MEDIUM_BEZEL_THRESHOLD = 168;
 
-const SCREEN_SIZE_FOR_WINDOW = (() => {
-    const availableWidth = window.innerWidth - MEDIUM_BEZEL_THRESHOLD;
-    const availableHeight = window.innerHeight - MEDIUM_BEZEL_THRESHOLD;
-    for (const [width, height] of [
-        [1600, 1200],
-        [1280, 1024],
-        [1152, 870],
-        [1024, 768],
-        [800, 600],
-        [640, 480],
-    ]) {
-        if (width <= availableWidth && height <= availableHeight) {
-            return {width, height};
-        }
+function computeInitialScreenSize(
+    machine: MachineDef,
+    screenSizeProp?: ScreenSize,
+    screenScaleProp?: number
+): {width: number; height: number} {
+    if (machine.fixedScreenSize) {
+        return machine.fixedScreenSize;
     }
-    return {width: 640, height: 480};
-})();
+    if (typeof screenSizeProp === "object") {
+        return screenSizeProp;
+    }
+    let {innerWidth: windowWidth, innerHeight: windowHeight} = window;
+    let {width: screenWidth, height: screenHeight} = window.screen;
+    if (screenScaleProp) {
+        windowWidth = Math.floor(windowWidth / screenScaleProp);
+        windowHeight = Math.floor(windowHeight / screenScaleProp);
+        screenWidth = Math.floor(screenWidth / screenScaleProp);
+        screenHeight = Math.floor(screenHeight / screenScaleProp);
+    }
+    switch (screenSizeProp) {
+        case undefined:
+        case "auto": {
+            const availableWidth = windowWidth - MEDIUM_BEZEL_THRESHOLD;
+            const availableHeight = windowHeight - MEDIUM_BEZEL_THRESHOLD;
+            const {supportedScreenSizes = DEFAULT_SUPPORTED_SCREEN_SIZES} =
+                machine;
+            for (const {width, height} of supportedScreenSizes) {
+                if (width <= availableWidth && height <= availableHeight) {
+                    return {width, height};
+                }
+            }
+            return {width: 640, height: 480};
+        }
+        case "window":
+        case "embed":
+            return {width: windowWidth, height: windowHeight};
+        case "fullscreen":
+            return {width: screenWidth, height: screenHeight};
+    }
+}
 
 // Assume that mobile devices that can't do hover events also need an explicit
 // control for bringing up the on-screen keyboard.
-const NEEDS_KEYBOARD_BUTTON =
+const USING_TOUCH_INPUT =
     "matchMedia" in window && !window.matchMedia("(hover: hover)").matches;
-
-const DEFAULT_EMULATOR_SETTINGS: EmulatorSettings = {
-    swapControlAndCommand: false,
-    speed: -2,
-};
 
 function MacEthernetStatus({
     provider,
@@ -768,22 +1249,26 @@ function MacEthernetStatus({
     );
 }
 
-function MacError({
-    appearance,
-    text,
-    onDone,
-}: {
-    appearance: Appearance;
-    text: string;
-    onDone: () => void;
-}) {
+function MacError({text, onDone}: {text: string; onDone: () => void}) {
     return (
-        <Dialog
-            appearance={appearance}
-            title="Emulator Error"
-            onDone={onDone}
-            doneLabel="Bummer">
+        <Dialog title="Emulator Error" onDone={onDone} doneLabel="Bummer">
             <p style={{whiteSpace: "pre-line"}}>{text}</p>
         </Dialog>
     );
+}
+
+function useTemporaryNotification(canShow: boolean, key: string) {
+    const [count, setCount] = usePersistentState(10, key);
+    const [hide, setHide] = useState(false);
+    const shouldShow = count > 0 && canShow;
+
+    useEffect(() => {
+        if (shouldShow) {
+            setCount(v => v - 1);
+            setTimeout(() => setHide(true), 10_000);
+        }
+    }, [setCount, shouldShow]);
+
+    const clearNotification = useCallback(() => setCount(0), [setCount]);
+    return [shouldShow && !hide, clearNotification] as const;
 }

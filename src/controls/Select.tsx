@@ -1,18 +1,17 @@
 import classNames from "classnames";
 import "./Select.css";
-import {type Appearance} from "./Appearance";
+import {appearanceSystemFont, useAppearance} from "./Appearance";
 
 export function Select({
-    appearance,
     className,
     children,
     ...selectProps
-}: {
-    appearance: Appearance;
-} & React.SelectHTMLAttributes<HTMLSelectElement>) {
+}: React.SelectHTMLAttributes<HTMLSelectElement>) {
+    const appearance = useAppearance();
     const selectClassName = classNames(
         "Select",
         `Select-${appearance}`,
+        appearanceSystemFont(appearance),
         className
     );
     return (

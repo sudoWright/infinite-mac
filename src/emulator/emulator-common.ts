@@ -1,35 +1,45 @@
 import {
+    type EmulatorDef,
     type EmulatorSpeed,
-    type EmulatorSubtype,
-    type EmulatorType,
 } from "./emulator-common-emulators";
 
 export const InputBufferAddresses = {
     globalLockAddr: 0,
+
     mousePositionFlagAddr: 1,
     mousePositionXAddr: 2,
     mousePositionYAddr: 3,
     mouseButtonStateAddr: 4,
+    mouseButton2StateAddr: 16,
+    mouseDeltaXAddr: 13,
+    mouseDeltaYAddr: 14,
+
     keyEventFlagAddr: 5,
     keyCodeAddr: 6,
     keyStateAddr: 7,
+    keyModifiersAddr: 15,
+
     stopFlagAddr: 8,
     ethernetInterruptFlagAddr: 9,
     audioContextRunningFlagAddr: 10,
+
     speedFlagAddr: 11,
     speedAddr: 12,
-    mouseDeltaXAddr: 13,
-    mouseDeltaYAddr: 14,
+
+    useMouseDeltasFlagAddr: 17,
+    useMouseDeltasAddr: 18,
+
+    pausedAddr: 19,
 };
 
 export type EmulatorMouseEvent =
     | {type: "mousemove"; x: number; y: number; deltaX: number; deltaY: number}
-    | {type: "mousedown"}
-    | {type: "mouseup"};
-export type EmulatorTouchEvent = {type: "touchstart"; x: number; y: number};
+    | {type: "mousedown"; button: number}
+    | {type: "mouseup"; button: number};
 export type EmulatorKeyboardEvent = {
     type: "keydown" | "keyup";
     keyCode: number;
+    modifiers?: number;
 };
 export type EmulatorStopEvent = {
     type: "stop";
@@ -52,15 +62,30 @@ export type EmulatorSetSpeedEvent = {
     speed: EmulatorSpeed;
 };
 
+export type EmulatorSetUseMouseDeltas = {
+    type: "set-use-mouse-deltas";
+    useMouseDeltas: boolean;
+};
+
+export type EmulatorPauseEvent = {
+    type: "pause";
+};
+
+export type EmulatorUnpauseEvent = {
+    type: "unpause";
+};
+
 export type EmulatorInputEvent =
     | EmulatorMouseEvent
-    | EmulatorTouchEvent
     | EmulatorKeyboardEvent
     | EmulatorStopEvent
     | EmulatorStartEvent
     | EmulatorEthernetInterruptEvent
     | EmulatorAudioContextRunningEvent
-    | EmulatorSetSpeedEvent;
+    | EmulatorSetSpeedEvent
+    | EmulatorSetUseMouseDeltas
+    | EmulatorPauseEvent
+    | EmulatorUnpauseEvent;
 
 export enum LockStates {
     READY_FOR_UI_THREAD,
@@ -78,6 +103,7 @@ export type EmulatorChunkedFileSpec = {
     prefetchChunks: number[];
     persistent?: boolean;
     isFloppy?: boolean;
+    hasDeviceImageHeader?: boolean;
 };
 
 export function generateChunkUrl(
@@ -95,6 +121,9 @@ export function generateNextChunkUrl(
     url: string,
     specs: EmulatorChunkedFileSpec[]
 ): string | undefined {
+    if (url.includes("CD-ROM")) {
+        return undefined;
+    }
     const match = url.match(/.*\/([0-9a-f]+)\.chunk#(\d+)$/);
     if (!match) {
         console.warn(`Could not parse chunk URL ${url}`);
@@ -118,16 +147,16 @@ export function generateNextChunkUrl(
     return generateChunkUrl(spec, chunkIndex + 1);
 }
 
-export type EmulatorWorkerConfig = {
-    emulatorType: EmulatorType;
-    emulatorSubtype?: EmulatorSubtype;
-    wasmUrl: string;
+export type EmulatorWorkerConfig = EmulatorDef & {
+    workerId: string;
+    wasm: ArrayBuffer;
     disks: EmulatorChunkedFileSpec[];
     delayedDisks?: EmulatorChunkedFileSpec[];
+    diskFiles: EmulatorDiskFile[];
     deviceImageHeader: ArrayBuffer;
     cdroms: EmulatorCDROM[];
-    useCDROM: boolean;
-    autoloadFiles: {[name: string]: ArrayBuffer};
+    usePlaceholderDisks: boolean;
+    autoloadFiles: {[name: string]: ArrayBufferLike};
     arguments: string[];
     video: EmulatorWorkerVideoConfig;
     input: EmulatorWorkerInputConfig;
@@ -135,6 +164,8 @@ export type EmulatorWorkerConfig = {
     files: EmulatorWorkerFilesConfig;
     ethernet: EmulatorWorkerEthernetConfig;
     clipboard: EmulatorWorkerClipboardConfig;
+    dateOffset: number;
+    speedGovernorTargetIPS?: number;
 };
 
 export type EmulatorWorkerVideoConfig =
@@ -258,6 +289,11 @@ export type EmulatorWorkerFallbackClipboardConfig = {
 
 export type EmulatorFileUpload = {name: string; url: string; size: number};
 
+export type EmulatorDiskFile = EmulatorFileUpload & {
+    isCDROM: boolean;
+    hasDeviceImageHeader?: boolean;
+};
+
 export type EmulatorFallbackCommand =
     | EmulatorFallbackInputCommand
     | EmulatorFallbackUploadFileCommand
@@ -302,30 +338,20 @@ export function updateInputBufferWithEvents(
     let mouseDeltaX = 0;
     let mouseDeltaY = 0;
     let mouseButtonState = -1;
+    let mouseButton2State = -1;
     let hasKeyEvent = false;
     let keyCode = -1;
     let keyState = -1;
+    let keyModifiers = 0;
     let hasStop = false;
     let hasStart = false;
     let hasEthernetInterrupt = false;
     let hasAudioContextRunning = false;
-    let hasSpeed = false;
-    let speed = -2;
     // currently only one key event can be sent per sync
     // TODO: better key handling code
     const remainingEvents: EmulatorInputEvent[] = [];
     for (const inputEvent of inputEvents) {
         switch (inputEvent.type) {
-            case "touchstart":
-                // We need to make sure that the mouse is first moved to the
-                // current location and then we send the mousedown, otherwise
-                // the Mac thinks that the mouse was moved with the button down,
-                // and interprets it as a drag.
-                hasMousePosition = true;
-                mousePositionX = inputEvent.x;
-                mousePositionY = inputEvent.y;
-                remainingEvents.push({type: "mousedown"});
-                break;
             case "mousemove":
                 if (hasMousePosition) {
                     break;
@@ -338,7 +364,11 @@ export function updateInputBufferWithEvents(
                 break;
             case "mousedown":
             case "mouseup":
-                mouseButtonState = inputEvent.type === "mousedown" ? 1 : 0;
+                if (inputEvent.button === 2) {
+                    mouseButton2State = inputEvent.type === "mousedown" ? 1 : 0;
+                } else {
+                    mouseButtonState = inputEvent.type === "mousedown" ? 1 : 0;
+                }
                 break;
             case "keydown":
             case "keyup":
@@ -349,6 +379,7 @@ export function updateInputBufferWithEvents(
                 hasKeyEvent = true;
                 keyState = inputEvent.type === "keydown" ? 1 : 0;
                 keyCode = inputEvent.keyCode;
+                keyModifiers = inputEvent.modifiers ?? 0;
                 break;
             case "stop":
                 hasStop = true;
@@ -363,8 +394,22 @@ export function updateInputBufferWithEvents(
                 hasAudioContextRunning = true;
                 break;
             case "set-speed":
-                hasSpeed = true;
-                speed = inputEvent.speed;
+                inputBufferView[InputBufferAddresses.speedFlagAddr] = 1;
+                inputBufferView[InputBufferAddresses.speedAddr] =
+                    inputEvent.speed;
+                break;
+            case "set-use-mouse-deltas":
+                inputBufferView[InputBufferAddresses.useMouseDeltasFlagAddr] =
+                    1;
+                inputBufferView[InputBufferAddresses.useMouseDeltasAddr] =
+                    inputEvent.useMouseDeltas ? 1 : 0;
+                break;
+            case "pause":
+                inputBufferView[InputBufferAddresses.pausedAddr] = 1;
+                break;
+            case "unpause":
+                console.warn("Unpause event should be handled directly");
+                break;
         }
     }
     if (hasMousePosition) {
@@ -378,10 +423,13 @@ export function updateInputBufferWithEvents(
     }
     inputBufferView[InputBufferAddresses.mouseButtonStateAddr] =
         mouseButtonState;
+    inputBufferView[InputBufferAddresses.mouseButton2StateAddr] =
+        mouseButton2State;
     if (hasKeyEvent) {
         inputBufferView[InputBufferAddresses.keyEventFlagAddr] = 1;
         inputBufferView[InputBufferAddresses.keyCodeAddr] = keyCode;
         inputBufferView[InputBufferAddresses.keyStateAddr] = keyState;
+        inputBufferView[InputBufferAddresses.keyModifiersAddr] = keyModifiers;
     }
     if (hasStop) {
         inputBufferView[InputBufferAddresses.stopFlagAddr] = 1;
@@ -394,36 +442,50 @@ export function updateInputBufferWithEvents(
     if (hasAudioContextRunning) {
         inputBufferView[InputBufferAddresses.audioContextRunningFlagAddr] = 1;
     }
-    if (hasSpeed) {
-        inputBufferView[InputBufferAddresses.speedFlagAddr] = 1;
-        inputBufferView[InputBufferAddresses.speedAddr] = speed;
-    }
     return remainingEvents;
 }
 export type EmulatorWorkerDirectorExtractionEntry =
-    | {
-          name: string;
-          contents: Uint8Array;
-      }
-    | {name: string; contents: EmulatorWorkerDirectorExtractionEntry[]};
+    | EmulatorWorkerDirectorExtractionFileEntry
+    | EmulatorWorkerDirectorExtractionDirectoryEntry;
 
-export type EmulatorWorkerDirectorExtraction = {
+export type EmulatorWorkerDirectorExtractionFileEntry = {
+    name: string;
+    contents: Uint8Array;
+};
+
+export type EmulatorWorkerDirectorExtractionDirectoryEntry = {
     name: string;
     contents: EmulatorWorkerDirectorExtractionEntry[];
 };
 
-export function isDiskImageFile(name: string): boolean {
-    name = name.toLowerCase();
+export type EmulatorWorkerDirectorExtraction =
+    EmulatorWorkerDirectorExtractionDirectoryEntry;
+
+export const diskImageExtensions = [
+    ".iso",
+    ".hda",
+    ".dsk",
+    ".img",
+    ".image",
+    ".toast",
+    ".cdr",
+    ".smi",
+];
+
+type File = {name: string; size: number};
+
+export function isDiskImageFile(file: File): boolean {
+    const name = file.name.toLowerCase();
     return (
-        name.endsWith(".iso") ||
-        name.endsWith(".hda") ||
-        name.endsWith(".dsk") ||
-        name.endsWith(".img") ||
-        name.endsWith(".image") ||
-        name.endsWith(".toast") ||
-        name.endsWith(".cdr") ||
-        name.endsWith(".smi")
+        isCDROMBinFile(file) ||
+        diskImageExtensions.some(ext => name.endsWith(ext))
     );
+}
+
+export function isCDROMBinFile({name, size}: File): boolean {
+    // Assume that if it's a large .bin file we're dealing with a CD-ROM image
+    // from a .bin/.cue pair.
+    return name.toLowerCase().endsWith(".bin") && size > 100_000_000;
 }
 
 export function ethernetMacAddressToString(mac: Uint8Array) {
@@ -449,10 +511,45 @@ export type EmulatorCDROM = {
     name: string;
     srcUrl: string;
     fileSize: number;
-    coverImageHash: string;
-    coverImageSize: [width: number, height: number];
+    coverImageHash?: string;
+    coverImageSize?: [width: number, height: number];
     coverImageType?: "square" | "round"; // Default is round
     mode?: "MODE1/2352"; // TODO: other modes
+    platform?: "Macintosh" | "NeXT";
+    fetchClientSide?: boolean;
+    mountReadWrite?: boolean;
+    prefetchChunks?: number[];
 };
 
 export type EmulatorCDROMLibrary = {[path: string]: EmulatorCDROM};
+
+export function generateChunkedFileSpecForCDROM(
+    cdrom: EmulatorCDROM
+): EmulatorChunkedFileSpec {
+    const CHUNK_SIZE = 128 * 1024;
+
+    const {name, fileSize: totalSize} = cdrom;
+    let chunkStart = 0;
+    const chunks: string[] = [];
+    while (chunkStart < totalSize) {
+        const chunkEnd = Math.min(chunkStart + CHUNK_SIZE, totalSize);
+        chunks.push(`${chunkStart}-${chunkEnd}`);
+        chunkStart = chunkEnd;
+    }
+    // Minimal metadata for worker/cd-rom.ts to reconstruct
+    const encoded = btoa(
+        JSON.stringify({
+            srcUrl: cdrom.srcUrl,
+            totalSize,
+        })
+    );
+
+    return {
+        name,
+        baseUrl: `/CD-ROM/${encoded}`,
+        totalSize,
+        chunks,
+        chunkSize: CHUNK_SIZE,
+        prefetchChunks: cdrom.prefetchChunks ?? [0],
+    };
+}

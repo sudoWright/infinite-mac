@@ -8,6 +8,8 @@
     background: #282c3422;
     padding: 10px;
     border-radius: 10px;
+    user-select: none;
+    -webkit-user-select: none;
 }
 
 .Footer span {
@@ -31,6 +33,11 @@
 .Footer .Footer-About {
     background-image: url(./Images/Footer-About.png);
     width: 36px;
+}
+
+.Footer .Footer-Fullscreen {
+    background-image: url(./Images/Footer-Fullscreen.png);
+    width: 68px;
 }
 
 .Footer .Footer-Donate {

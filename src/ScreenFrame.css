@@ -117,6 +117,13 @@
     cursor: pointer;
 }
 
+.ScreenFrame-Controls-Container
+    .ScreenFrame-Control.ScreenFrame-Control-Selected {
+    background: rgba(0, 0, 0, 0.4);
+    border-radius: 4px;
+    outline: solid 2px rgba(0, 0, 0, 0.4);
+}
+
 @media (hover: hover) {
     .ScreenFrame-Controls-Container .ScreenFrame-Control {
         visibility: hidden;
@@ -127,24 +134,36 @@
     }
 }
 
-.ScreenFrame-Apple-Logo {
+.ScreenFrame-Logo {
     position: relative;
     height: 30px;
     width: 18px;
 }
 
-.ScreenFrame-Bezel-Medium .ScreenFrame-Apple-Logo {
+.ScreenFrame-Bezel-NeXT .ScreenFrame-Logo {
+    width: 24px;
+}
+
+.ScreenFrame-Bezel-Medium .ScreenFrame-Logo {
     height: 28px;
     width: 14px;
 }
 
-.ScreenFrame-Bezel-Small-ish .ScreenFrame-Apple-Logo {
+.ScreenFrame-Bezel-NeXT.ScreenFrame-Bezel-Medium .ScreenFrame-Logo {
+    width: 18px;
+}
+
+.ScreenFrame-Bezel-Small-ish .ScreenFrame-Logo {
     height: 36px;
     width: 12px;
 }
 
+.ScreenFrame-Bezel-NeXT.ScreenFrame-Bezel-Small-ish .ScreenFrame-Logo {
+    width: 15px;
+}
+
 /* Hide the Apple logo if it's not top of the bezel */
-.ScreenFrame-Bezel-Small .ScreenFrame-Apple-Logo {
+.ScreenFrame-Bezel-Small .ScreenFrame-Logo {
     display: none;
 }
 
@@ -155,17 +174,17 @@
     font-size: 0.8em;
 }
 
-.ScreenFrame-Apple-Logo svg {
+.ScreenFrame-Logo svg {
     height: 100%;
     width: 100%;
     position: absolute;
 }
 
-.ScreenFrame-Apple-Logo .Foreground {
+.ScreenFrame-Logo .Foreground {
     filter: brightness(1.1);
 }
 
-.ScreenFrame-Apple-Logo .Background {
+.ScreenFrame-Logo .Background {
     top: -0.5px;
     left: -0.5px;
     filter: brightness(0.5);
@@ -197,8 +216,16 @@
 
 .ScreenFrame-Bezel-Text {
     color: var(--screen-bezel-color-dark1);
-    text-shadow: 0.5px 0.5px rgba(255, 255, 255, 0.6),
+    text-shadow:
+        0.5px 0.5px rgba(255, 255, 255, 0.6),
         -0.5px -0.5px rgba(0, 0, 0, 0.6);
+}
+
+.ScreenFrame-Bezel-NeXT .ScreenFrame-Bezel-Text {
+    color: var(--screen-bezel-color-light2);
+    text-shadow:
+        0.5px 0.5px rgba(255, 255, 255, 0.3),
+        -0.5px -0.5px rgba(0, 0, 0, 0.9);
 }
 
 /* Platinum is a simple set of color overrides. */
@@ -208,6 +235,15 @@
     --screen-bezel-color-dark2: hsl(0deg 0% 75%);
     --screen-bezel-color-light1: hsl(0deg 0% 90%);
     --screen-bezel-color-light2: hsl(0deg 0% 95%);
+}
+
+/* NeXT is a simple set of color overrides. */
+.ScreenFrame-Bezel-NeXT {
+    --screen-bezel-color: hsl(220deg 3% 15%);
+    --screen-bezel-color-dark1: hsl(220deg 3% 5%);
+    --screen-bezel-color-dark2: hsl(220deg 3% 10%);
+    --screen-bezel-color-light1: hsl(220deg 3% 20%);
+    --screen-bezel-color-light2: hsl(220deg 3% 25%);
 }
 
 /* Pinstripes tries to replicate the style of the 1999 Apple Cinema Display. */
@@ -242,6 +278,7 @@
     --screen-outer-corner-radius: 28px;
 }
 
+.ScreenFrame-Bezel-Pinstripes.ScreenFrame-Bezel-Small,
 .ScreenFrame-Bezel-Pinstripes.ScreenFrame-Bezel-Small-ish {
     --screen-outer-chamfer-size: 8px;
     border-image-slice: 30;
@@ -255,26 +292,26 @@
 }
 
 /* Center Apple logo by making the entire container full-width */
-.ScreenFrame-Bezel-Pinstripes .ScreenFrame-Controls-Container {
+.ScreenFrame-CenterLogo .ScreenFrame-Controls-Container {
     width: 100%;
 }
 
-.ScreenFrame-Bezel-Pinstripes
+.ScreenFrame-CenterLogo
     .ScreenFrame-Controls-Container
-    .ScreenFrame-Apple-Logo
+    .ScreenFrame-Logo
     + .ScreenFrame-Control {
     margin-left: 0;
 }
 
-.ScreenFrame-Bezel-Pinstripes .ScreenFrame-Apple-Logo {
+.ScreenFrame-CenterLogo .ScreenFrame-Logo {
     left: calc(50% - 10px);
 }
 
-.ScreenFrame-Bezel-Pinstripes .ScreenFrame-Apple-Logo .Background {
+.ScreenFrame-Bezel-Pinstripes .ScreenFrame-Logo .Background {
     filter: none;
 }
 
-.ScreenFrame-Bezel-Pinstripes .ScreenFrame-Apple-Logo .Background path {
+.ScreenFrame-Bezel-Pinstripes .ScreenFrame-Logo .Background path {
     /* Turn shadow into gloss */
     fill: #ffffffaa !important;
 }

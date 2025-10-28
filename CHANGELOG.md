@@ -1,12 +1,30 @@
 # CHANGELOG
 
+2025-09-15: Better support for importing and exporting files with resource forks. See https://blog.persistent.info/2025/09/infinite-mac-resource-forks.html for more details.
+
+2025-07-08: Added the ability to embed Infinite Mac instances in other websites. See https://blog.persistent.info/2025/07/infinite-mac-embedding.html for more details, and https://infinitemac.org/monkey/ for a demo.
+
+2025-03-24: Added early Mac OS X releases (10.0 to 10.4). See https://blog.persistent.info/2025/03/infinite-mac-os-x.html for more details.
+
+2024-11-03: Added a Macintosh Garden software library drawer. See https://blog.persistent.info/2024/11/infinite-mac-macintosh-garden-library.html for more details.
+
+2024-03-25: Added all major NeXTSTEP releases. See https://blog.persistent.info/2024/03/infinite-mac-nextstep.html for more details.
+
+2024-02-19: Added option to use relative mouse movement in Basilisk II and SheepShaver-based machines, which improves compatibility with some games.
+
+2024-01-25: Custom instances now support overriding the current date.
+
+2023-12-13: Experimental support for the Power Macintosh 6100 and G3 (Beige) machines. See https://blog.persistent.info/2023/12/dingusppc.html for more details.
+
+2023-12-09: Custom instances now support custom screen sizes.
+
 2023-09-09: Added the Saved HD as a way to persist data. Its contents can also be imported and exported.
 
 2023-08-13: Custom instances now support overriding the RAM size of the emulated machine.
 
 2023-07-20: Added the option to create custom instances with arbitrary system disks and URL-based disk images: https://infinitemac.org/run.
 
-2023-06-19: Added a CD-ROM library, with a few dozen CDs that can be browsed and mounted, as the ability to mount arbirary CD-ROM images from archive.org and similar sites.
+2023-06-19: Added a CD-ROM library, with a few dozen CDs that can be browsed and mounted, and the ability to mount arbitrary CD-ROM images from archive.org and similar sites.
 
 2023-06-03: Filtering of system software releases (all vs. just notable ones).
 

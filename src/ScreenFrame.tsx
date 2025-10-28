@@ -1,12 +1,13 @@
 import React from "react";
 import "./ScreenFrame.css";
-import {ReactComponent as AppleLogoColor} from "./Images/AppleLogoColor.svg";
-import {ReactComponent as AppleLogoGrey} from "./Images/AppleLogoGrey.svg";
+import AppleLogoColor from "./Images/AppleLogoColor.svg?react";
+import AppleLogoGrey from "./Images/AppleLogoGrey.svg?react";
+import NeXTLogo from "./Images/NeXTLogo.svg?react";
 import classNames from "classnames";
 
 export type ScreenFrameProps = {
     className?: string;
-    bezelStyle: "Beige" | "Platinum" | "Pinstripes";
+    bezelStyle: "Beige" | "Platinum" | "Pinstripes" | "NeXT";
     bezelSize?: "Small" | "Small-ish" | "Medium" | "Large";
     width: number;
     height: number;
@@ -16,12 +17,14 @@ export type ScreenFrameProps = {
     controls?: ScreenControl[];
     screen?: React.ReactElement;
     children?: React.ReactNode;
+    viewTransitionName?: string;
 } & React.HTMLAttributes<HTMLDivElement>;
 
 export type ScreenControl = {
     label: string;
     handler: () => void;
     alwaysVisible?: boolean;
+    selected?: boolean;
 };
 
 export function ScreenFrame(props: ScreenFrameProps) {
@@ -37,6 +40,7 @@ export function ScreenFrame(props: ScreenFrameProps) {
         controls = [],
         screen,
         children,
+        viewTransitionName,
         ...divProps
     } = props;
 
@@ -46,14 +50,20 @@ export function ScreenFrame(props: ScreenFrameProps) {
         `ScreenFrame-Bezel-${bezelSize}`,
         className,
         {
+            "ScreenFrame-CenterLogo":
+                bezelStyle === "NeXT" || bezelStyle === "Pinstripes",
             "ScreenFrame-Fullscreen": fullscreen,
         }
     );
     const ledClassName = classNames("ScreenFrame-Led", {
         "ScreenFrame-Led-Loading": led === "Loading",
     });
-    const AppleLogo =
-        bezelStyle === "Pinstripes" ? AppleLogoGrey : AppleLogoColor;
+    const Logo =
+        bezelStyle === "NeXT"
+            ? NeXTLogo
+            : bezelStyle === "Pinstripes"
+              ? AppleLogoGrey
+              : AppleLogoColor;
 
     return (
         <div
@@ -62,24 +72,34 @@ export function ScreenFrame(props: ScreenFrameProps) {
                 width: `calc(${width}px + 2 * var(--screen-underscan))`,
                 height: `calc(${height}px + 2 * var(--screen-underscan))`,
                 transform: scale === undefined ? undefined : `scale(${scale})`,
+                viewTransitionName,
             }}
             {...divProps}>
             <div className="ScreenFrame-Controls-Container">
-                <div className="ScreenFrame-Apple-Logo">
-                    <AppleLogo className="Background" />
-                    <AppleLogo className="Foreground" />
+                <div className="ScreenFrame-Logo">
+                    <Logo className="Background" />
+                    <Logo className="Foreground" />
                 </div>
-                {controls.map(({label, handler, alwaysVisible}, i) => (
-                    <div
-                        className="ScreenFrame-Control ScreenFrame-Bezel-Text"
-                        style={{
-                            visibility: alwaysVisible ? "visible" : undefined,
-                        }}
-                        onClick={handler}
-                        key={label}>
-                        {label}
-                    </div>
-                ))}
+                {controls.map(
+                    ({label, handler, alwaysVisible, selected}, i) => (
+                        <div
+                            className={classNames(
+                                "ScreenFrame-Control ScreenFrame-Bezel-Text",
+                                {
+                                    "ScreenFrame-Control-Selected": selected,
+                                }
+                            )}
+                            style={{
+                                visibility: alwaysVisible
+                                    ? "visible"
+                                    : undefined,
+                            }}
+                            onClick={handler}
+                            key={label}>
+                            {label}
+                        </div>
+                    )
+                )}
             </div>
             {led !== "None" && <div className={ledClassName} />}
             <div

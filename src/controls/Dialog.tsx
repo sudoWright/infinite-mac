@@ -3,7 +3,11 @@ import ReactDOM from "react-dom";
 import {Button} from "./Button";
 import "./Dialog.css";
 import classNames from "classnames";
-import {type Appearance} from "./Appearance";
+import {
+    appearanceSystemFont,
+    useAppearance,
+    useAppearanceVariant,
+} from "./Appearance";
 
 export function Dialog({
     title,
@@ -11,10 +15,10 @@ export function Dialog({
     onDone,
     doneLabel = "Done",
     doneEnabled = true,
+    doneClassName,
     onOther,
     otherLabel,
     onCancel,
-    appearance = "Classic",
     className,
 }: {
     title: string;
@@ -22,29 +26,28 @@ export function Dialog({
     onDone: (e: React.MouseEvent) => void;
     doneLabel?: string;
     doneEnabled?: boolean;
+    doneClassName?: string;
     onOther?: (e: React.MouseEvent) => void;
     otherLabel?: string;
     onCancel?: () => void;
-    appearance?: Appearance;
     className?: string;
 }) {
+    const appearance = useAppearance();
     const dialog = (
-        <div className="Dialog-Backdrop">
-            <div
-                className={classNames(
-                    "Dialog",
-                    `Dialog-${appearance}`,
-                    className
-                )}>
-                <h1>{title}</h1>
+        <div
+            className={classNames(
+                "Dialog-Backdrop",
+                `Dialog-Backdrop-${appearance}`
+            )}>
+            <DialogFrame className={className}>
+                <h1 className={appearanceSystemFont(appearance)}>{title}</h1>
 
-                {children}
+                <div className="Dialog-Content">{children}</div>
 
                 <footer>
                     {onCancel && (
                         <Button
                             className="Dialog-Normal-Button"
-                            appearance={appearance}
                             onClick={e => {
                                 e.preventDefault();
                                 onCancel();
@@ -55,7 +58,6 @@ export function Dialog({
                     {onOther && (
                         <Button
                             className="Dialog-Normal-Button"
-                            appearance={appearance}
                             onClick={e => {
                                 e.preventDefault();
                                 onOther(e);
@@ -64,8 +66,8 @@ export function Dialog({
                         </Button>
                     )}
                     <Button
+                        className={doneClassName}
                         disabled={!doneEnabled}
-                        appearance={appearance}
                         onClick={e => {
                             e.preventDefault();
                             onDone(e);
@@ -73,10 +75,34 @@ export function Dialog({
                         {doneLabel}
                     </Button>
                 </footer>
-            </div>
+            </DialogFrame>
         </div>
     );
     return ReactDOM.createPortal(dialog, dialogRootNode);
+}
+
+export function DialogFrame({
+    children,
+    className,
+}: {
+    children: React.ReactNode;
+    className?: string;
+}) {
+    const appearance = useAppearance();
+    const appearanceVariant = useAppearanceVariant();
+    return (
+        <div
+            className={classNames(
+                "Dialog",
+                `Dialog-${appearance}`,
+                {
+                    "Dialog-System7": appearanceVariant === "System7",
+                },
+                className
+            )}>
+            {children}
+        </div>
+    );
 }
 
 const dialogRootNode = document.getElementById("dialog-root")!;

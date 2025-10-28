@@ -1,13 +1,16 @@
 import {useCallback, useEffect, useState} from "react";
-import {type EmulatorSettings} from "./emulator/emulator-ui";
+import {
+    type EmulatorScreenScaling,
+    type EmulatorSettings,
+} from "./emulator/emulator-ui-settings";
 import {
     type EmulatorSpeed,
     type EmulatorType,
     emulatorSupportsSpeedSetting,
     EMULATOR_SPEEDS,
+    emulatorSupportsMouseDeltas,
 } from "./emulator/emulator-common-emulators";
 import {Dialog} from "./controls/Dialog";
-import {type Appearance} from "./controls/Appearance";
 import {Select} from "./controls/Select";
 import {Checkbox} from "./controls/Checkbox";
 import {Button} from "./controls/Button";
@@ -16,7 +19,6 @@ import "./MacSettings.css";
 export function MacSettings({
     emulatorType,
     emulatorSettings,
-    appearance,
     setEmulatorSettings,
     onStorageReset,
     onStorageExport,
@@ -27,7 +29,6 @@ export function MacSettings({
 }: {
     emulatorType: EmulatorType;
     emulatorSettings: EmulatorSettings;
-    appearance: Appearance;
     setEmulatorSettings: (settings: EmulatorSettings) => void;
     hasSavedHD: boolean;
     onStorageReset: () => void;
@@ -64,33 +65,59 @@ export function MacSettings({
     const [storageExportVisible, setStorageExportVisible] = useState(false);
     const [storageImportVisible, setStorageImportVisible] = useState(false);
     const [saveImageVisible, setSaveImageVisible] = useState(false);
+    const {screenScaling = "auto"} = emulatorSettings;
 
     return (
-        <Dialog title="Settings" onDone={onDone} appearance={appearance}>
-            <label>
-                <Checkbox
-                    appearance={appearance}
-                    checked={emulatorSettings.swapControlAndCommand}
-                    onChange={() =>
-                        setEmulatorSettings({
-                            ...emulatorSettings,
-                            swapControlAndCommand:
-                                !emulatorSettings.swapControlAndCommand,
-                        })
-                    }
-                />
-                Swap Control and Command Keys
+        <Dialog title="Settings" onDone={onDone}>
+            <div className="MacSettings-Row">
+                <div className="MacSettings-Row-Label">Input:</div>
+                <label>
+                    <Checkbox
+                        checked={emulatorSettings.swapControlAndCommand}
+                        onChange={() =>
+                            setEmulatorSettings({
+                                ...emulatorSettings,
+                                swapControlAndCommand:
+                                    !emulatorSettings.swapControlAndCommand,
+                            })
+                        }
+                    />
+                    Swap Control and Command Keys
+                </label>
                 <div className="Dialog-Description">
                     Makes it easier to use shortcuts like Command-W, Command-Q
                     or Command-Shift-3 (which are otherwise handled by the host
                     browser or OS).
                 </div>
-            </label>
+            </div>
+            {emulatorSupportsMouseDeltas(emulatorType) &&
+                !emulatorSettings.trackpadMode && (
+                    <div className="MacSettings-Row">
+                        <div className="MacSettings-Row-Label" />
+                        <label>
+                            <Checkbox
+                                checked={emulatorSettings.useMouseDeltas}
+                                onChange={() =>
+                                    setEmulatorSettings({
+                                        ...emulatorSettings,
+                                        useMouseDeltas:
+                                            !emulatorSettings.useMouseDeltas,
+                                    })
+                                }
+                            />
+                            Use relative mouse movements
+                        </label>
+                        <div className="Dialog-Description">
+                            Send relative mouse movements to the emulator
+                            instead of absolute positions. This can help with
+                            compatibility of games such as Apeiron.
+                        </div>
+                    </div>
+                )}
             {emulatorSupportsSpeedSetting(emulatorType) && (
-                <label>
-                    Speed:
+                <div className="MacSettings-Row">
+                    <div className="MacSettings-Row-Label">Speed:</div>
                     <Select
-                        appearance={appearance}
                         value={emulatorSettings.speed}
                         onChange={event =>
                             setEmulatorSettings({
@@ -110,23 +137,40 @@ export function MacSettings({
                         )}
                     </Select>
                     <div className="Dialog-Description">
-                        Very old software may be timing dependent and thus only
-                        work at 1x speeds.
+                        Very old software may be timing-dependent.
                     </div>
-                </label>
+                </div>
             )}
+            <div className="MacSettings-Row">
+                <div className="MacSettings-Row-Label">Scaling:</div>
+                <Select
+                    value={screenScaling}
+                    onChange={e => {
+                        const screenScaling = e.target
+                            .value as EmulatorScreenScaling;
+                        setEmulatorSettings({
+                            ...emulatorSettings,
+                            screenScaling,
+                        });
+                    }}>
+                    <option value="auto">Auto</option>
+                    <option value="smooth">Smooth</option>
+                    <option value="pixelated">Crisp</option>
+                </Select>
+                <div className="Dialog-Description">
+                    Preferred scaling method when displaying the Mac screen at
+                    non-native sizes.
+                </div>
+            </div>
             {hasSavedHD && (
                 <>
                     <h2>Saved HD</h2>
                     <div className="MacSettings-Row">
                         <div className="MacSettings-Row-Label">Contents:</div>
-                        <Button
-                            appearance={appearance}
-                            onClick={() => setStorageExportVisible(true)}>
+                        <Button onClick={() => setStorageExportVisible(true)}>
                             Export…
                         </Button>
                         <StorageConfirmDialog
-                            appearance={appearance}
                             visible={storageExportVisible}
                             setVisible={setStorageExportVisible}
                             title="Export Disk"
@@ -136,13 +180,10 @@ export function MacSettings({
                                 onDone();
                             }}
                         />{" "}
-                        <Button
-                            appearance={appearance}
-                            onClick={() => setStorageImportVisible(true)}>
+                        <Button onClick={() => setStorageImportVisible(true)}>
                             Import…
                         </Button>
                         <StorageConfirmDialog
-                            appearance={appearance}
                             visible={storageImportVisible}
                             setVisible={setStorageImportVisible}
                             title="Import Disk"
@@ -152,13 +193,10 @@ export function MacSettings({
                                 onDone();
                             }}
                         />{" "}
-                        <Button
-                            appearance={appearance}
-                            onClick={() => setStorageResetVisible(true)}>
+                        <Button onClick={() => setStorageResetVisible(true)}>
                             Reset
                         </Button>
                         <StorageConfirmDialog
-                            appearance={appearance}
                             visible={storageResetVisible}
                             setVisible={setStorageResetVisible}
                             title="Reset Disk"
@@ -177,13 +215,10 @@ export function MacSettings({
                     </div>
                     <div className="MacSettings-Row">
                         <div className="MacSettings-Row-Label" />
-                        <Button
-                            appearance={appearance}
-                            onClick={() => setSaveImageVisible(true)}>
+                        <Button onClick={() => setSaveImageVisible(true)}>
                             Save Disk Image…
                         </Button>
                         <StorageConfirmDialog
-                            appearance={appearance}
                             visible={saveImageVisible}
                             setVisible={setSaveImageVisible}
                             title="Save Image"
@@ -212,9 +247,7 @@ export function MacSettings({
                         {storagePersistenceStatus !== "persistent" && (
                             <>
                                 {" "}
-                                <Button
-                                    appearance={appearance}
-                                    onClick={handleRequestPersistence}>
+                                <Button onClick={handleRequestPersistence}>
                                     Request Persistence
                                 </Button>
                             </>
@@ -244,7 +277,6 @@ function StorageConfirmDialog({
     onAccept,
     onOther,
     otherLabel,
-    appearance,
 }: {
     visible: boolean;
     setVisible: (visible: boolean) => void;
@@ -253,7 +285,6 @@ function StorageConfirmDialog({
     onAccept: () => void;
     onOther?: () => void;
     otherLabel?: string;
-    appearance: Appearance;
 }) {
     if (!visible) {
         return null;
@@ -268,8 +299,7 @@ function StorageConfirmDialog({
             doneLabel={title}
             onOther={onOther}
             otherLabel={otherLabel}
-            onCancel={() => setVisible(false)}
-            appearance={appearance}>
+            onCancel={() => setVisible(false)}>
             <div style={{maxWidth: 400}}>{body}</div>
         </Dialog>
     );

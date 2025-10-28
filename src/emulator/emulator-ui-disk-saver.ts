@@ -3,7 +3,7 @@ import {saveAs} from "file-saver";
 import {type EmulatorDiskDef} from "../disks";
 import {dirtyChunksFileName, dataFileName} from "./emulator-common-disk-saver";
 import {generateChunkUrl} from "./emulator-common";
-import deviceImageHeaderPath from "../Data/Device Image Header.hda";
+import deviceImageHeaderPath from "../Data/Device Image Header (Apple SCSI 4.3 Driver).hda";
 import {generateDeviceImageHeader} from "./emulator-common-device-image";
 
 export async function resetDiskSaver(disk: EmulatorDiskDef) {
@@ -40,7 +40,7 @@ export async function exportDiskSaver(disk: EmulatorDiskDef) {
 
     const zipBlob = await zip.generateAsync({
         compression: "DEFLATE",
-        compressionOptions: {level: 9},
+        compressionOptions: {level: 1},
         type: "blob",
     });
     saveAs(zipBlob, spec.name + ".infinitemacdisk");
@@ -135,7 +135,6 @@ export async function saveDiskSaverImage(
             continue;
         }
 
-        console.log("Fetching chunk", chunkIndex);
         const chunkUrl = generateChunkUrl(chunkedSpec, chunkIndex);
         const chunk = await (await fetch(chunkUrl)).arrayBuffer();
         image.set(new Uint8Array(chunk), chunkIndex * spec.chunkSize);
@@ -147,7 +146,8 @@ export async function saveDiskSaverImage(
         ).arrayBuffer();
         const deviceImageHeader = generateDeviceImageHeader(
             baseDeviceImageHeader,
-            spec.totalSize
+            spec.totalSize,
+            false
         );
         saveAs(new Blob([deviceImageHeader, image]), spec.name + ".hda");
         return;

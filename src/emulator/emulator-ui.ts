@@ -1,19 +1,18 @@
 import {
+    type EmulatorDiskFile,
     type EmulatorCDROM,
     type EmulatorChunkedFileSpec,
     type EmulatorFallbackCommand,
     type EmulatorWorkerConfig,
     type EmulatorWorkerVideoBlit,
+    type EmulatorMouseEvent,
+    generateChunkedFileSpecForCDROM,
 } from "./emulator-common";
 import {
-    type EmulatorSpeed,
-    EMULATOR_CD_DRIVE_COUNT,
-    emulatorCpuId,
-    emulatorModelId,
-    emulatorUsesCDROMDrive,
-    emulatorUsesPrefs,
-    emulatorUsesArgs,
-    emulatorNeedsPointerLock,
+    emulatorUsesPlaceholderDisks,
+    emulatorNeedsMouseDeltas,
+    type EmulatorDef,
+    emulatorSupportsMouseDeltas,
 } from "./emulator-common-emulators";
 import {getEmulatorWasmPath} from "./emulator-ui-emulators";
 import Worker from "./emulator-worker?worker";
@@ -40,11 +39,13 @@ import {
 } from "./emulator-ui-files";
 import {
     handleDirectoryExtraction,
-    uploadsFromDirectoryExtractionFile,
+    handleDirectoryExtractionRaw,
+    uploadsFromFile,
 } from "./emulator-ui-extractor";
 import {
     JS_CODE_TO_ADB_KEYCODE,
     JS_CODE_TO_MINI_VMAC_KEYCODE,
+    JS_CODE_TO_NEXT_KEYCODE,
 } from "./emulator-key-codes";
 import {
     type EmulatorEthernet,
@@ -61,7 +62,17 @@ import {
 } from "./emulator-ui-clipboard";
 import {type MachineDefRAMSize, type MachineDef} from "../machines";
 import {type EmulatorDiskDef} from "../disks";
-import deviceImageHeaderPath from "../Data/Device Image Header.hda";
+import deviceImageHeaderPath from "../Data/Device Image Header (All Drivers).hda";
+import {fetchCDROM} from "./emulator-ui-cdrom";
+import {EmulatorTrackpadController} from "./emulator-ui-trackpad";
+import {
+    configToDingusPPCArgs,
+    configToPreviousConfig,
+    configToMacemuPrefs,
+    configToPearPCConfig,
+} from "./emulator-ui-config";
+import {stringToArrayBuffer} from "../strings";
+import {type EmulatorSettings} from "./emulator-ui-settings";
 
 export type EmulatorConfig = {
     machine: MachineDef;
@@ -71,16 +82,16 @@ export type EmulatorConfig = {
     screenHeight: number;
     screenCanvas: HTMLCanvasElement;
     disks: EmulatorDiskDef[];
+    diskFiles: EmulatorDiskFile[];
     delayedDisks?: EmulatorDiskDef[];
     cdroms: EmulatorCDROM[];
     ethernetProvider?: EmulatorEthernetProvider;
+    customDate?: Date;
+    startPaused?: boolean;
+    autoPause?: boolean;
     debugAudio?: boolean;
     debugLog?: boolean;
-};
-
-export type EmulatorSettings = {
-    swapControlAndCommand: boolean;
-    speed: EmulatorSpeed;
+    debugTrackpad?: boolean;
 };
 
 export interface EmulatorEthernetProvider {
@@ -109,6 +120,7 @@ export interface EmulatorDelegate {
     emulatorDidFinishLoading?(emulator: Emulator): void;
     emulatorDidStartToLoadDiskChunk?(emulator: Emulator): void;
     emulatorDidFinishLoadingDiskChunk?(emulator: Emulator): void;
+    emulatorDidBecomeQuiescent?(emulator: Emulator): void;
     emulatorEthernetPeersDidChange?(
         emulator: Emulator,
         peers: readonly EmulatorEthernetPeer[]
@@ -120,6 +132,12 @@ export interface EmulatorDelegate {
         errorRaw: string
     ): void;
     emulatorSettings?(emulator: Emulator): EmulatorSettings;
+    emulatorDidMakeCDROMLoadingProgress?(
+        emulator: Emulator,
+        cdrom: EmulatorCDROM,
+        progress: number
+    ): void;
+    emulatorDidDrawScreen?(emulator: Emulator, data: ImageData): void;
 }
 
 export type EmulatorFallbackCommandSender = (
@@ -131,6 +149,9 @@ export class Emulator {
     #delegate?: EmulatorDelegate;
     #worker: Worker;
     #workerTerminated: boolean = false;
+    // Doesn't have to be secure, just unique enough for a few instances that
+    // may be used concurrently.
+    #workerId = Math.random().toString(16).slice(2);
 
     #screenCanvasContext: CanvasRenderingContext2D;
     #screenImageData: ImageData;
@@ -146,6 +167,7 @@ export class Emulator {
     #serviceWorkerReady?: Promise<boolean>;
 
     #gotFirstBlit = false;
+    #intersectionObserver?: IntersectionObserver;
 
     #ethernetPinger: EthernetPinger;
 
@@ -153,7 +175,9 @@ export class Emulator {
     // some edge cases.
     #downKeyCodes = new Set<string>();
 
-    #requestedPointerLock = false;
+    #mouseX = 0;
+    #mouseY = 0;
+    #trackpadController: EmulatorTrackpadController;
 
     constructor(config: EmulatorConfig, delegate?: EmulatorDelegate) {
         console.time("Emulator first blit");
@@ -180,6 +204,7 @@ export class Emulator {
                 if (serviceWorkerAvailable) {
                     this.#serviceWorker!.postMessage({
                         type: "worker-command",
+                        workerId: this.#workerId,
                         command,
                     });
                 } else {
@@ -203,8 +228,8 @@ export class Emulator {
             ? new SharedMemoryEmulatorVideo(config)
             : new FallbackEmulatorVideo(config);
         this.#input = useSharedMemory
-            ? new SharedMemoryEmulatorInput()
-            : new FallbackEmulatorInput(fallbackCommandSender!);
+            ? new SharedMemoryEmulatorInput(config)
+            : new FallbackEmulatorInput(config, fallbackCommandSender!);
         this.#audio = useSharedMemory
             ? new SharedMemoryEmulatorAudio(this.#input)
             : new FallbackEmulatorAudio(this.#input);
@@ -237,28 +262,50 @@ export class Emulator {
         this.#clipboard = useSharedMemory
             ? new SharedMemoryEmulatorClipboard()
             : new FallbackEmulatorClipboard(fallbackCommandSender!);
+        this.#trackpadController = new EmulatorTrackpadController({
+            trackpadDidMove: (deltaX, deltaY) => {
+                this.#input.handleInput({
+                    type: "mousemove",
+                    // Also send the absolute position, for emulators that don't
+                    // support deltas.
+                    x: this.#mouseX,
+                    y: this.#mouseY,
+                    deltaX,
+                    deltaY,
+                });
+                this.#mouseX += deltaX;
+                this.#mouseY += deltaY;
+            },
+            trackpadButtonDown: button => {
+                this.#input.handleInput({type: "mousedown", button});
+            },
+            trackpadButtonUp: button => {
+                this.#input.handleInput({type: "mouseup", button});
+            },
+        });
     }
 
     async start() {
         const {screenCanvas: canvas} = this.#config;
-        canvas.addEventListener("touchmove", this.#handleTouchMove);
+        canvas.addEventListener("pointermove", this.#handlePointerMove);
+        canvas.addEventListener("pointerdown", this.#handlePointerDown);
+        canvas.addEventListener("pointerup", this.#handlePointerUp);
         canvas.addEventListener("touchstart", this.#handleTouchStart);
-        canvas.addEventListener("touchend", this.#handleTouchEnd);
-        canvas.addEventListener("mousemove", this.#handleMouseMove);
-        canvas.addEventListener("mousedown", this.#handleMouseDown);
-        canvas.addEventListener("mouseup", this.#handleMouseUp);
         window.addEventListener("keydown", this.#handleKeyDown);
         window.addEventListener("keyup", this.#handleKeyUp);
         window.addEventListener("beforeunload", this.#handleBeforeUnload);
+        if (this.#config.autoPause) {
+            this.#intersectionObserver = new IntersectionObserver(
+                this.#handleIntersectionChange
+            );
+            this.#intersectionObserver.observe(canvas);
+        }
 
         document.addEventListener(
             "visibilitychange",
             this.#handleVisibilityChange
         );
-        document.addEventListener(
-            "pointerlockchange",
-            this.#handlePointerLockChange
-        );
+        window.addEventListener("blur", this.#handleWindowBlur);
 
         await this.#startWorker();
     }
@@ -271,15 +318,35 @@ export class Emulator {
 
         const emulatorWasmPath = getEmulatorWasmPath(this.#config.machine);
 
+        let extraMachineFiles: {[fileName: string]: string} = {
+            ...this.#config.machine.extraFiles,
+        };
+        for (const disk of [
+            ...this.#config.disks,
+            ...(this.#config.delayedDisks ?? []),
+        ]) {
+            extraMachineFiles = {
+                ...extraMachineFiles,
+                ...disk.extraMachineFiles?.get(this.#config.machine),
+            };
+        }
+
         // Fetch all of the dependent files ourselves, to avoid a waterfall
         // if we let Emscripten handle it (it would first load the JS, and
         // then that would load the WASM and data files).
-        const [[wasmBlobUrl], [rom, basePrefs, deviceImageHeader]] = await load(
-            [emulatorWasmPath],
+        const [
+            wasm,
+            rom,
+            basePrefs,
+            deviceImageHeader,
+            ...extraMachineFileContents
+        ] = await load(
             [
+                emulatorWasmPath,
                 this.#config.machine.romPath,
                 this.#config.machine.prefsPath,
                 deviceImageHeaderPath,
+                ...Object.values(extraMachineFiles),
             ],
             (total, left) => {
                 this.#delegate?.emulatorDidMakeLoadingProgress?.(
@@ -298,60 +365,120 @@ export class Emulator {
             ? await loadDisks(this.#config.delayedDisks)
             : undefined;
 
-        let prefs = "";
-        let prefsBuffer;
+        const autoloadFiles: {[name: string]: ArrayBufferLike} = {};
+        Object.keys(extraMachineFiles).forEach((fileName, i) => {
+            autoloadFiles[fileName] = extraMachineFileContents[i];
+        });
+
         let args: string[] = [];
-        const {emulatorType, emulatorSubtype} = this.#config.machine;
-        if (emulatorUsesPrefs(emulatorType)) {
-            prefs = configToEmulatorPrefs(this.#config, {
-                basePrefs,
-                disks,
-                romFileName,
-            });
-            prefsBuffer = new TextEncoder().encode(prefs).buffer;
-            console.groupCollapsed(
-                "%cGenerated emulator prefs",
-                "font-weight: normal"
-            );
-            console.log(prefs);
-            console.groupEnd();
-        } else if (emulatorUsesArgs(emulatorType)) {
-            args = configToEmulatorArgs(this.#config, {disks, romFileName});
-            console.groupCollapsed(
-                "%cGenerated emulator args",
-                "font-weight: normal"
-            );
-            console.log(JSON.stringify(args, undefined, 2));
-            console.groupEnd();
-        } else {
-            throw new Error(`Unknown emulator type: ${emulatorType}`);
+        let configDebugStr;
+        const {emulatorType, emulatorSubtype, speedGovernorTargetIPS} =
+            this.#config.machine;
+        switch (emulatorType) {
+            case "DingusPPC":
+                args = configToDingusPPCArgs(this.#config, {
+                    disks,
+                    romFileName,
+                });
+                configDebugStr = args.join(" ");
+                break;
+            case "Previous": {
+                const config = configToPreviousConfig(this.#config, {
+                    baseConfig: basePrefs,
+                    disks,
+                    romFileName,
+                });
+                autoloadFiles["previous.cfg"] = stringToArrayBuffer(config);
+                // Previous expects to find all of the disk files on the filesystem,
+                // create some dummy files.
+                for (const disk of [
+                    ...disks,
+                    ...(delayedDisks ?? []),
+                    ...this.#config.cdroms,
+                    ...this.#config.diskFiles,
+                ]) {
+                    autoloadFiles[disk.name] = new ArrayBuffer(0);
+                }
+                configDebugStr = config;
+                break;
+            }
+            case "BasiliskII":
+            case "SheepShaver":
+            case "Mini vMac": {
+                const prefs = configToMacemuPrefs(this.#config, {
+                    basePrefs,
+                    disks,
+                    romFileName,
+                });
+                args = ["--config", "prefs"];
+                autoloadFiles["prefs"] = stringToArrayBuffer(prefs);
+                configDebugStr = prefs;
+                break;
+            }
+            case "PearPC": {
+                const config = configToPearPCConfig(this.#config, {
+                    baseConfig: basePrefs,
+                    disks,
+                });
+                autoloadFiles["PearPC.cfg"] = stringToArrayBuffer(config);
+                args = ["PearPC.cfg"];
+                configDebugStr = config;
+                break;
+            }
         }
+        console.groupCollapsed(
+            "%cGenerated emulator config",
+            "font-weight: normal"
+        );
+        console.log(configDebugStr);
+        console.groupEnd();
+
+        const dateOffset = this.#config.customDate
+            ? this.#config.customDate.getTime() - Date.now()
+            : 0;
 
         const config: EmulatorWorkerConfig = {
-            emulatorType,
-            emulatorSubtype,
-            wasmUrl: wasmBlobUrl,
+            ...({
+                emulatorType,
+                emulatorSubtype,
+            } as EmulatorDef),
+            workerId: this.#workerId,
+            wasm,
             disks,
             delayedDisks,
+            diskFiles: this.#config.diskFiles,
             deviceImageHeader,
-            cdroms: this.#config.cdroms,
-            useCDROM: emulatorUsesCDROMDrive(emulatorType),
+            cdroms: await this.#handleCDROMs(this.#config.cdroms),
+            usePlaceholderDisks: emulatorUsesPlaceholderDisks(emulatorType),
             autoloadFiles: {
                 [romFileName]: rom,
-                ...(prefsBuffer ? {"prefs": prefsBuffer} : {}),
+                ...autoloadFiles,
             },
-            arguments: prefs ? ["--config", "prefs"] : args,
+            arguments: args,
             video: this.#video.workerConfig(),
             input: this.#input.workerConfig(),
             audio: this.#audio.workerConfig(),
             files: this.#files.workerConfig(),
             ethernet: this.#ethernet.workerConfig(),
             clipboard: this.#clipboard.workerConfig(),
+            dateOffset,
+            speedGovernorTargetIPS,
         };
 
         const serviceWorkerAvailable = await this.#serviceWorkerReady;
         if (serviceWorkerAvailable) {
-            for (const spec of config.disks.concat(config.delayedDisks ?? [])) {
+            const specs = [
+                ...config.disks,
+                ...(config.delayedDisks ?? []),
+                ...config.cdroms
+                    .filter(
+                        cdrom =>
+                            !cdrom.fetchClientSide &&
+                            cdrom.prefetchChunks?.length
+                    )
+                    .map(generateChunkedFileSpecForCDROM),
+            ];
+            for (const spec of specs) {
                 this.#serviceWorker!.postMessage({
                     type: "init-disk-cache",
                     spec,
@@ -363,27 +490,34 @@ export class Emulator {
             );
         }
         this.#worker.postMessage({type: "start", config}, [
+            wasm,
             rom,
             deviceImageHeader,
-            ...(prefsBuffer ? [prefsBuffer] : []),
+            ...Object.values(autoloadFiles),
         ]);
     }
 
     refreshSettings() {
-        const speed = this.#delegate?.emulatorSettings?.(this)?.speed;
+        const settings = this.#delegate?.emulatorSettings?.(this);
+        const speed = settings?.speed;
         if (speed !== undefined) {
             this.#input.handleInput({type: "set-speed", speed});
+        }
+        const useMouseDeltas = this.#trackpadMode() || settings?.useMouseDeltas;
+        if (useMouseDeltas !== undefined) {
+            this.#input.handleInput({
+                type: "set-use-mouse-deltas",
+                useMouseDeltas,
+            });
         }
     }
 
     stop() {
         const {screenCanvas: canvas} = this.#config;
-        canvas.removeEventListener("touchmove", this.#handleTouchMove);
+        canvas.removeEventListener("pointermove", this.#handlePointerMove);
+        canvas.removeEventListener("pointerdown", this.#handlePointerDown);
+        canvas.removeEventListener("pointerup", this.#handlePointerUp);
         canvas.removeEventListener("touchstart", this.#handleTouchStart);
-        canvas.removeEventListener("touchend", this.#handleTouchEnd);
-        canvas.removeEventListener("mousemove", this.#handleMouseMove);
-        canvas.removeEventListener("mousedown", this.#handleMouseDown);
-        canvas.removeEventListener("mouseup", this.#handleMouseUp);
         window.removeEventListener("keydown", this.#handleKeyDown);
         window.removeEventListener("keyup", this.#handleKeyUp);
         window.removeEventListener("beforeunload", this.#handleBeforeUnload);
@@ -392,14 +526,17 @@ export class Emulator {
             "visibilitychange",
             this.#handleVisibilityChange
         );
-        document.addEventListener(
-            "pointerlockchange",
-            this.#handlePointerLockChange
-        );
+        window.removeEventListener("blur", this.#handleWindowBlur);
 
         this.#input.handleInput({type: "stop"});
         this.#ethernetPinger.stop();
         this.#audio.stop();
+
+        if (this.#intersectionObserver) {
+            this.#intersectionObserver.unobserve(canvas);
+            this.#intersectionObserver.disconnect();
+            this.#intersectionObserver = undefined;
+        }
     }
 
     restart(whileStopped?: () => Promise<void>): Promise<void> {
@@ -428,12 +565,45 @@ export class Emulator {
         });
     }
 
+    pause() {
+        this.#input.handleInput({type: "pause"});
+    }
+
+    unpause() {
+        this.#input.handleInput({type: "unpause"});
+    }
+
+    handleExternalInput(
+        event: EmulatorMouseEvent | {type: "keydown" | "keyup"; code: string}
+    ) {
+        switch (event.type) {
+            case "mousedown":
+            case "mouseup":
+            case "mousemove":
+                this.#input.handleInput(event);
+                break;
+            case "keydown":
+            case "keyup": {
+                const adbKeyCode = this.#getAdbKeyCode(event.code);
+                if (adbKeyCode !== undefined) {
+                    this.#input.handleInput({
+                        type: event.type,
+                        keyCode: adbKeyCode,
+                    });
+                } else {
+                    console.warn(`Unhandled key: ${event.code}`);
+                }
+                break;
+            }
+        }
+    }
+
     async uploadFiles(files: File[], names: string[] = []) {
         const remainingFiles = [];
         const remainingNames: string[] = [];
         for (let i = 0; i < files.length; i++) {
             const file = files[i];
-            const uploads = await uploadsFromDirectoryExtractionFile(file);
+            const uploads = await uploadsFromFile(file);
             if (uploads) {
                 this.#files.uploadFiles(uploads);
                 continue;
@@ -453,95 +623,129 @@ export class Emulator {
         );
     }
 
-    loadCDROM(cdrom: EmulatorCDROM) {
-        this.#files.loadCDROM(cdrom);
+    async loadCDROM(cdrom: EmulatorCDROM) {
+        const cdroms = await this.#handleCDROMs([cdrom]);
+        this.#files.loadCDROM(cdroms[0]);
     }
 
-    #handleMouseMove = (event: MouseEvent) => {
-        this.#input.handleInput({
-            type: "mousemove",
-            x: event.offsetX,
-            y: event.offsetY,
-            deltaX: event.movementX,
-            deltaY: event.movementY,
-        });
-    };
+    async #handleCDROMs(cdroms: EmulatorCDROM[]): Promise<EmulatorCDROM[]> {
+        const result = [];
+        for (const cdrom of cdroms) {
+            if (cdrom.fetchClientSide) {
+                result.push(
+                    await fetchCDROM(cdrom, loadedFraction => {
+                        this.#delegate?.emulatorDidMakeCDROMLoadingProgress?.(
+                            this,
+                            cdrom,
+                            loadedFraction
+                        );
+                    })
+                );
+            } else {
+                result.push(cdrom);
+            }
+        }
+        return result;
+    }
 
-    #handleMouseDown = (event: MouseEvent) => {
-        this.#input.handleInput({type: "mousedown"});
-        if (
-            emulatorNeedsPointerLock(this.#config.machine.emulatorType) &&
-            !this.#requestedPointerLock
-        ) {
-            this.#config.screenCanvas.requestPointerLock({
-                unadjustedMovement: true,
+    #useMouseDeltas() {
+        const {emulatorType} = this.#config.machine;
+        return (
+            emulatorNeedsMouseDeltas(emulatorType) ||
+            (this.#delegate?.emulatorSettings?.(this).useMouseDeltas === true &&
+                emulatorSupportsMouseDeltas(emulatorType))
+        );
+    }
+
+    #trackpadMode() {
+        if (this.#useMouseDeltas() && !HAS_HOVER_EVENTS) {
+            return true;
+        }
+        return (
+            this.#delegate?.emulatorSettings?.(this).trackpadMode ??
+            this.#config.debugTrackpad ??
+            false
+        );
+    }
+
+    #handlePointerMove = (event: PointerEvent) => {
+        if (this.#trackpadMode()) {
+            this.#trackpadController.handlePointerMove(event);
+        } else {
+            this.#mouseX = event.offsetX;
+            this.#mouseY = event.offsetY;
+            this.#input.handleInput({
+                type: "mousemove",
+                x: event.offsetX,
+                y: event.offsetY,
+                deltaX: event.movementX,
+                deltaY: event.movementY,
             });
-            this.#requestedPointerLock = true;
         }
     };
 
-    #handlePointerLockChange = (event: Event): void => {
-        if (!document.pointerLockElement) {
-            this.#requestedPointerLock = false;
+    #handlePointerDown = (event: PointerEvent) => {
+        if (this.#trackpadMode()) {
+            this.#trackpadController.handlePointerDown(event);
+            return;
+        }
+        this.#mouseX = event.offsetX;
+        this.#mouseY = event.offsetY;
+        const handleMouseDown = () => {
+            this.#input.handleInput({
+                type: "mousedown",
+                button: event.button,
+            });
+        };
+        if (HAS_HOVER_EVENTS) {
+            handleMouseDown();
+        } else {
+            // If we don't have hover events (e.g. we're on mobile), it means
+            // that we haven't gotten movement events to the current location,
+            // so we need to first send the coordinates and then (after they've
+            // been processed, which will hopefully be within a frame) send the
+            // click event.
+            this.#input.handleInput({
+                type: "mousemove",
+                x: event.offsetX,
+                y: event.offsetY,
+                deltaX: event.movementX,
+                deltaY: event.movementY,
+            });
+            setTimeout(handleMouseDown, 16);
+        }
+        if (this.#useMouseDeltas() && !document.pointerLockElement) {
+            this.#config.screenCanvas.requestPointerLock({
+                unadjustedMovement: false,
+            });
         }
     };
 
-    #handleMouseUp = (event: MouseEvent) => {
-        this.#input.handleInput({type: "mouseup"});
-    };
-
-    #handleTouchMove = (event: TouchEvent) => {
-        this.#input.handleInput({
-            type: "mousemove",
-            ...this.#getTouchLocation(event),
-        });
+    #handlePointerUp = (event: PointerEvent) => {
+        if (this.#trackpadMode()) {
+            this.#trackpadController.handlePointerUp(event);
+        } else {
+            this.#input.handleInput({type: "mouseup", button: event.button});
+        }
     };
 
     #handleTouchStart = (event: TouchEvent) => {
-        // Avoid mouse events also being dispatched for the touch.
+        // Make sure that text selection is not triggered when doing tap and
+        // drag gestures.
         event.preventDefault();
-        // Though we want to treat this as a mouse down, we haven't gotten the
-        // move to the current location yet, so we need to send the coordinates
-        // as well.
-        this.#input.handleInput({
-            type: "touchstart",
-            ...this.#getTouchLocation(event),
-        });
-    };
-
-    #getTouchLocation(event: TouchEvent): {
-        x: number;
-        y: number;
-        deltaX: number;
-        deltaY: number;
-    } {
-        const touch = event.touches[0];
-        const target = touch.target as HTMLElement;
-        const targetBounds = target.getBoundingClientRect();
-        // The touch coordinates and the target bounds are affected by the scale
-        // transform that we do when in full-screen mode, so we need to undo
-        // it.
-        const scaleFactor = targetBounds.width / target.offsetWidth;
-        return {
-            x: (touch.clientX - targetBounds.left) / scaleFactor,
-            y: (touch.clientY - targetBounds.top) / scaleFactor,
-            // Touch events do not support movementX/Y, do not generate deltas
-            // for them for now.
-            deltaX: 0,
-            deltaY: 0,
-        };
-    }
-
-    #handleTouchEnd = (event: TouchEvent) => {
-        this.#input.handleInput({type: "mouseup"});
     };
 
     #handleKeyDown = (event: KeyboardEvent) => {
-        if (event.target instanceof HTMLInputElement) {
+        const {target, code} = event;
+        // Ignore input events in UI, except for the dummy <input> that we use
+        // to get keyboard events on mobile.
+        if (
+            target instanceof HTMLInputElement &&
+            !target.classList.contains("Mac-Keyboard-Input")
+        ) {
             return;
         }
         event.preventDefault();
-        const {code} = event;
         const adbKeyCode = this.#getAdbKeyCode(code);
         if (adbKeyCode !== undefined) {
             this.#downKeyCodes.add(code);
@@ -550,7 +754,7 @@ export class Emulator {
             // to the emulator so that it can be used when executing the paste.
             // Ideally we would watch for a clipboardchange event, but that's not
             // supported broadly (see https://crbug.com/933608).
-            if (code === "KeyV" && event.metaKey) {
+            if (code === "KeyV" && (event.metaKey || event.ctrlKey)) {
                 navigator.clipboard.readText().then(
                     text => this.#clipboard.setClipboardText(text),
                     error => console.error("Could not read clipboard", error)
@@ -559,6 +763,7 @@ export class Emulator {
             this.#input.handleInput({
                 type: "keydown",
                 keyCode: adbKeyCode,
+                modifiers: this.#getAdbKeyModifiers(event),
             });
         } else {
             console.warn(`Unhandled key: ${code}`);
@@ -575,6 +780,7 @@ export class Emulator {
                 this.#input.handleInput({
                     type: "keyup",
                     keyCode: adbKeyCode,
+                    modifiers: this.#getAdbKeyModifiers(event),
                 });
             }
         };
@@ -605,6 +811,9 @@ export class Emulator {
                 code = "Control" + code.slice("Meta".length);
             }
         }
+        if (this.#config.machine.emulatorType === "Previous") {
+            return JS_CODE_TO_NEXT_KEYCODE[code];
+        }
         if (this.#config.machine.emulatorType === "Mini vMac") {
             const keyCode = JS_CODE_TO_MINI_VMAC_KEYCODE[code];
             if (keyCode !== undefined) {
@@ -614,18 +823,62 @@ export class Emulator {
         return JS_CODE_TO_ADB_KEYCODE[code];
     }
 
-    #handleBeforeUnload = () => {
-        // Mostly necessary for the fallback mode, otherwise the page can hang
-        // during reload because the worker is not yielding.
-        this.stop();
+    #getAdbKeyModifiers(event: KeyboardEvent): number | undefined {
+        // Only Previous needs to have modifiers sent separately.
+        if (this.#config.machine.emulatorType !== "Previous") {
+            return undefined;
+        }
+        let modifiers = 0;
+        if (event.altKey) {
+            modifiers |= 0x20; // NEXTKEY_MOD_LALT
+        }
+        if (event.shiftKey) {
+            modifiers |= 0x02; // NEXTKEY_MOD_LSHIFT
+        }
+        // Previous appears to already do a meta/control swap, so we need to
+        // flip the modifier codes that we send it.
+        if (this.#delegate?.emulatorSettings?.(this).swapControlAndCommand) {
+            if (event.ctrlKey) {
+                modifiers |= 0x08; // NEXTKEY_MOD_LCTRL
+            }
+            if (event.metaKey) {
+                modifiers |= 0x01; // NEXTKEY_MOD_META
+            }
+        } else {
+            if (event.ctrlKey) {
+                modifiers |= 0x01; // NEXTKEY_MOD_META
+            }
+            if (event.metaKey) {
+                modifiers |= 0x08; // NEXTKEY_MOD_LCTRL
+            }
+        }
+        return modifiers;
+    }
+
+    #handleBeforeUnload = (event: Event) => {
+        // On macOS hosts it's too easy to accidentally close the tab due to
+        // muscle memory for Command-W, so we'll ask for confirmation if the
+        // navigation away is due a command+key combination.
+        if (
+            navigator.platform.startsWith("Mac") &&
+            Array.from(this.#downKeyCodes).some(code => code.startsWith("Meta"))
+        ) {
+            event.preventDefault();
+
+            // We'll never get a keyup event for the command key, so we'll
+            // need to synthesize one to avoid the guest ending up with it
+            // stuck on.
+            this.#releaseDownKeys();
+        }
     };
 
     #handleWorkerMessage = (e: MessageEvent) => {
         if (e.data.type === "emulator_ready") {
             this.#delegate?.emulatorDidFinishLoading?.(this);
-        } else if (e.data.type === "emulator_exit") {
-            this.#delegate?.emulatorDidExit?.(this);
         } else if (e.data.type === "emulator_video_open") {
+            console.log(
+                `Initializing video (${e.data.width}x${e.data.height})`
+            );
             const {width, height} = e.data;
             this.#screenImageData = this.#screenCanvasContext.createImageData(
                 width,
@@ -653,11 +906,21 @@ export class Emulator {
                 this.#audio.handleData(e.data.data);
             }
         } else if (e.data.type === "emulator_extract_directory") {
-            handleDirectoryExtraction(e.data.extraction);
+            // Raw extraction is for internal use only (for adding to the
+            // library), so hide it behind a modifier.
+            if (
+                this.#downKeyCodes.has("AltLeft") ||
+                this.#downKeyCodes.has("AltRight")
+            ) {
+                handleDirectoryExtractionRaw(e.data.extraction);
+            } else {
+                handleDirectoryExtraction(e.data.extraction);
+            }
         } else if (e.data.type === "emulator_quiescent") {
             console.timeEnd("Emulator quiescent");
+            this.#delegate?.emulatorDidBecomeQuiescent?.(this);
         } else if (e.data.type === "emulator_stopped") {
-            this.#handleEmulatorStopped();
+            this.#handleEmulatorStopped(e.data.isExit);
         } else if (e.data.type === "emulator_ethernet_init") {
             const {ethernetProvider} = this.#config;
             if (ethernetProvider) {
@@ -687,8 +950,8 @@ export class Emulator {
         } else if (e.data.type === "emulator_did_have_error") {
             this.#delegate?.emulatorDidHaveError?.(
                 this,
-                e.data.error,
-                e.data.errorRaw ?? e.data.error
+                String(e.data.error),
+                String(e.data.errorRaw ?? e.data.error)
             );
         } else if (e.data.type === "emulator_will_load_chunk") {
             this.#delegate?.emulatorDidStartToLoadDiskChunk?.(this);
@@ -700,7 +963,44 @@ export class Emulator {
     };
 
     #handleVisibilityChange = () => {
+        if (this.#config.autoPause) {
+            if (document.hidden) {
+                this.pause();
+                return;
+            } else {
+                this.unpause();
+            }
+        }
         this.#drawScreen();
+    };
+
+    #handleWindowBlur = () => {
+        // We'll never get keyup events for these keys (if using a shortcut that
+        // switches to another tab).
+        this.#releaseDownKeys();
+    };
+
+    #releaseDownKeys() {
+        for (const code of this.#downKeyCodes) {
+            const adbKeyCode = this.#getAdbKeyCode(code);
+            if (adbKeyCode !== undefined) {
+                this.#input.handleInput({
+                    type: "keyup",
+                    keyCode: adbKeyCode,
+                });
+            }
+        }
+        this.#downKeyCodes.clear();
+    }
+
+    #handleIntersectionChange = (entries: IntersectionObserverEntry[]) => {
+        for (const entry of entries) {
+            if (entry.isIntersecting) {
+                this.unpause();
+            } else {
+                this.pause();
+            }
+        }
     };
 
     #drawScreen() {
@@ -726,6 +1026,7 @@ export class Emulator {
         } else {
             this.#screenCanvasContext.putImageData(this.#screenImageData, 0, 0);
         }
+        this.#delegate?.emulatorDidDrawScreen?.(this, this.#screenImageData);
     }
 
     #clearScreen() {
@@ -787,41 +1088,31 @@ export class Emulator {
         });
     }
 
-    async #handleEmulatorStopped() {
+    async #handleEmulatorStopped(isExit?: boolean) {
         this.#worker.removeEventListener("message", this.#handleWorkerMessage);
         this.#worker.terminate();
         this.#workerTerminated = true;
+        if (isExit) {
+            this.#delegate?.emulatorDidExit?.(this);
+        }
     }
 }
 
 async function load(
-    blobUrlPaths: string[],
-    arrayBufferPaths: string[],
+    paths: string[],
     progress: (total: number, left: number) => any
-): Promise<[string[], ArrayBuffer[]]> {
-    const paths = blobUrlPaths.concat(arrayBufferPaths);
+): Promise<ArrayBuffer[]> {
     let left = paths.length;
     progress(paths.length, left);
-
-    const blobUrls: string[] = [];
     const arrayBuffers: ArrayBuffer[] = [];
-
     await Promise.all(
-        paths.map(async path => {
+        paths.map(async (path, i) => {
             const response = await fetch(path);
-            const blobUrlIndex = blobUrlPaths.indexOf(path);
-            if (blobUrlIndex !== -1) {
-                const blobUrl = URL.createObjectURL(await response.blob());
-                blobUrls[blobUrlIndex] = blobUrl;
-            } else {
-                const arrayBufferIndex = arrayBufferPaths.indexOf(path);
-                arrayBuffers[arrayBufferIndex] = await response.arrayBuffer();
-            }
+            arrayBuffers[i] = await response.arrayBuffer();
             progress(paths.length, --left);
         })
     );
-
-    return [blobUrls, arrayBuffers];
+    return arrayBuffers;
 }
 
 async function loadDisks(
@@ -836,103 +1127,9 @@ async function loadDisks(
         prefetchChunks: d.prefetchChunks,
         persistent: d.persistent,
         isFloppy: d.isFloppy,
+        hasDeviceImageHeader: d.hasDeviceImageHeader,
     }));
 }
 
-function configToEmulatorPrefs(
-    config: EmulatorConfig,
-    {
-        basePrefs,
-        romFileName,
-        disks,
-    }: {
-        basePrefs: ArrayBuffer;
-        romFileName: string;
-        disks: EmulatorChunkedFileSpec[];
-    }
-): string {
-    const {machine} = config;
-    let prefsStr = new TextDecoder().decode(basePrefs);
-    prefsStr += `rom ${romFileName}\n`;
-    const cpuId = emulatorCpuId(machine.emulatorType, machine.cpu);
-    if (cpuId !== undefined) {
-        prefsStr += `cpu ${cpuId}\n`;
-    }
-    const modelId = emulatorModelId(machine.emulatorType, machine.gestaltID);
-    if (modelId !== undefined) {
-        prefsStr += `modelid ${modelId}\n`;
-    }
-    const ramSizeString = config.ramSize ?? machine.ramSizes[0];
-    let ramSize = parseInt(ramSizeString);
-    if (ramSizeString.endsWith("M")) {
-        ramSize *= 1024 * 1024;
-    } else if (ramSizeString.endsWith("K")) {
-        ramSize *= 1024;
-    }
-    prefsStr += `ramsize ${ramSize}\n`;
-    prefsStr += `screen win/${config.screenWidth}/${config.screenHeight}\n`;
-    for (const spec of disks) {
-        prefsStr += `disk ${spec.name}\n`;
-    }
-    for (const cdrom of config.cdroms) {
-        prefsStr += `disk ${cdrom.name}\n`;
-    }
-    const useCDROM = emulatorUsesCDROMDrive(machine.emulatorType);
-    if (useCDROM) {
-        for (let i = 0; i < EMULATOR_CD_DRIVE_COUNT; i++) {
-            prefsStr += `cdrom /cdrom/${i}\n`;
-        }
-    }
-    if (config.ethernetProvider) {
-        prefsStr += "appletalk true\n";
-    }
-    // The fallback path does not support high-frequency calls to reading
-    // the input (we end up making so many service worker network requests
-    // that overall emulation latency suffers).
-    prefsStr += `jsfrequentreadinput ${config.useSharedMemory}\n`;
-    return prefsStr;
-}
-
-function configToEmulatorArgs(
-    config: EmulatorConfig,
-    {
-        romFileName,
-        disks,
-    }: {
-        romFileName: string;
-        disks: EmulatorChunkedFileSpec[];
-    }
-): string[] {
-    const args = ["--realtime", "--bootrom", romFileName];
-    if (config.debugLog) {
-        args.push(
-            "--log-to-stderr",
-            "--log-no-uptime",
-            "--log-to-stderr-verbose"
-        );
-    }
-    let addedHardDisk = false;
-    let addedFloppy = false;
-    for (const spec of disks) {
-        // TODO: support more than one disk in DingusPPC
-        if (spec.isFloppy) {
-            if (addedFloppy) {
-                continue;
-            }
-            addedFloppy = true;
-        } else {
-            if (addedHardDisk) {
-                continue;
-            }
-            addedHardDisk = true;
-        }
-        args.push(spec.isFloppy ? "--fdd_img" : "--hdd_img", spec.name);
-    }
-    for (const spec of config.cdroms) {
-        args.push("--cdr_img", spec.name);
-    }
-    if (config.ramSize?.endsWith("M")) {
-        args.push("--rambank1_size", config.ramSize.slice(0, -1));
-    }
-    return args;
-}
+const HAS_HOVER_EVENTS =
+    "matchMedia" in window && window.matchMedia("(hover: hover)").matches;
