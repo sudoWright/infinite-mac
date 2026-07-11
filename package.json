@@ -18,7 +18,7 @@
         "use-debounce": "^10.0.3"
     },
     "devDependencies": {
-        "@cloudflare/vite-plugin": "^1.7.5",
+        "@cloudflare/vite-plugin": "^1.44.0",
         "@cloudflare/workers-types": "^4.20250525.0",
         "@eslint/compat": "^1.2.9",
         "@eslint/eslintrc": "^3.3.1",
@@ -43,7 +43,7 @@
         "prettier": "^3.5.3",
         "vite": "^6.3.5",
         "vite-plugin-svgr": "^4.3.0",
-        "wrangler": "^4.19.1"
+        "wrangler": "^4.110.0"
     },
     "scripts": {
         "import-emulator": "scripts/import-emulator.sh",
